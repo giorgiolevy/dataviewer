@@ -143,14 +143,30 @@ class HDF5Parser {
   readF64(addr, n) { const r = new Float64Array(n); for (let i=0; i<n; i++) r[i]=this.f64(addr+i*8); return r; }
   extractMetadata() {
     const m = { xaxis:{name:'',label:'',unit:''}, yaxis:{name:'',label:'',unit:''}, array:{name:'',label:'',unit:''}, objectName:'' };
-    for (const an of ['xunit','xlabel','xname','yunit','ylabel','yname','unit','label','name','metadata']) {
-      const idx = this.findString(an); if (idx===-1 || this.raw[idx-1]!==an.length) continue;
-      const da = this.u64(idx+an.length); if (da===0||da>=this.raw.length) continue;
-      let sz=0;
-      for (let i=0; i<this.raw.length-20; i++) { if (this.raw[i]===0x03&&this.raw[i+1]===0x01&&this.u64(i+2)===da) { sz=this.u64(i+10); break; } }
-      if (sz>0 && sz<1000 && da+sz<=this.raw.length) {
-        const v = new TextDecoder().decode(this.raw.slice(da, da+sz));
-        if (an==='xunit') m.xaxis.unit=v; else if(an==='xlabel') m.xaxis.label=v; else if(an==='xname') m.xaxis.name=v; else if(an==='yunit') m.yaxis.unit=v; else if(an==='ylabel') m.yaxis.label=v; else if(an==='yname') m.yaxis.name=v; else if(an==='unit') m.array.unit=v; else if(an==='label') m.array.label=v; else if(an==='name') m.array.name=v; else if(an==='metadata') m.objectName=v;
+    const attrs = ['xunit','xlabel','xname','yunit','ylabel','yname','unit','label','name','metadata'];
+    for (const an of attrs) {
+      let idx = 0;
+      while ((idx = this.findString(an, idx)) !== -1) {
+        if (this.raw[idx-1] === an.length) {
+          const da = this.u64(idx+an.length); 
+          if (da===0||da>=this.raw.length) { idx++; continue; }
+          let sz=0;
+          for (let i=0; i<this.raw.length-20; i++) { 
+            if (this.raw[i]===0x03 && this.raw[i+1]===0x01 && this.u64(i+2)===da) { 
+              sz=this.u64(i+10); break; 
+            } 
+          }
+          if (sz>0 && sz<1000 && da+sz<=this.raw.length) {
+            const v = new TextDecoder().decode(this.raw.slice(da, da+sz));
+            if (an==='xunit') m.xaxis.unit=v; else if(an==='xlabel') m.xaxis.label=v;
+            else if(an==='xname') m.xaxis.name=v; else if(an==='yunit') m.yaxis.unit=v;
+            else if(an==='ylabel') m.yaxis.label=v; else if(an==='yname') m.yaxis.name=v;
+            else if(an==='unit') m.array.unit=v; else if(an==='label') m.array.label=v;
+            else if(an==='name') m.array.name=v; else if(an==='metadata') m.objectName=v;
+            break; // Found valid attribute, break inner while loop
+          }
+        }
+        idx++; // Continue searching for next occurrence
       }
     }
     return m;
