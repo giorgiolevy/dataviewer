@@ -9,7 +9,7 @@
   --bg-color: #ffffff; --text-color: #333333; --toolbar-bg: #f8f9fa;
   --border-color: #dee2e6; --canvas-bg: #ffffff; --axis-color: #333333;
   --grid-color: #e0e0e0; --profile-line: #000000; --input-bg: #ffffff;
-  --button-hover: #e9ecef; --status-color: #d62728;
+  --button-hover: #e9ecec; --status-color: #d62728;
 }
 body.dark-mode {
   --bg-color: #1a1a2e; --text-color: #e0e0e0; --toolbar-bg: #16213e;
@@ -30,8 +30,11 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-colo
 #status { font-size: 13px; color: var(--status-color); width: 100%; }
 #main { display: flex; flex: 1; overflow: hidden; }
 #plotArea { flex: 1; position: relative; background: var(--bg-color); overflow: hidden; padding: 5px; touch-action: none; transition: background 0.2s; }
-#heatmapCanvas { width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+#canvasWrap { position: relative; width: 100%; height: 100%; }
+#heatmapCanvas, #overlayCanvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; touch-action: none; }
+#heatmapCanvas { cursor: crosshair; }
 #heatmapCanvas.panning { cursor: grabbing; }
+#overlayCanvas { pointer-events: none; }
 #profileArea { width: 380px; background: var(--bg-color); border-left: 1px solid var(--border-color); display: flex; flex-direction: column; overflow: hidden; transition: background 0.2s, border-color 0.2s; }
 .profilePanel { flex: 1; display: flex; flex-direction: column; padding: 10px; min-height: 0; }
 .profilePanel h3 { font-size: 14px; color: var(--status-color); margin-bottom: 8px; }
@@ -59,9 +62,11 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-colo
   body { background: white !important; color: black !important; margin: 0; padding: 0; overflow: visible; }
   body.dark-mode { --bg-color: #ffffff !important; --text-color: #333333 !important; --canvas-bg: #ffffff !important; --axis-color: #333333 !important; --grid-color: #e0e0e0 !important; --profile-line: #000000 !important; }
   #toolbar, #loadOverlay, #fileInput, #ctxMenu, #profileArea { display: none !important; }
+  #overlayCanvas { display: none !important; }
   #main { display: block; height: 100vh; width: 100vw; }
   #plotArea { width: 100%; height: 100%; padding: 20px; border: none; overflow: visible; background: white !important; }
-  #heatmapCanvas { width: 100%; height: 100%; max-width: 100%; max-height: 100%; }
+  #canvasWrap { position: static; width: 100%; height: 100%; }
+  #heatmapCanvas { position: static; width: 100%; height: 100%; max-width: 100%; max-height: 100%; }
 }
 </style>
 </head>
@@ -96,7 +101,10 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-colo
   </div>
   <div id="main">
     <div id="plotArea">
-      <canvas id="heatmapCanvas"></canvas>
+      <div id="canvasWrap">
+        <canvas id="heatmapCanvas"></canvas>
+        <canvas id="overlayCanvas"></canvas>
+      </div>
     </div>
     <div id="profileArea">
       <div class="profilePanel">
@@ -126,48 +134,36 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-colo
   <div onclick="resetView()">🔄 Reset View</div>
 </div>
 <input type="file" id="fileInput" accept=".h5,.hdf5,.hdf" style="display:none">
-<script>
-// ===== HDF5 Parser =====
+<script id="hdf5-parser-src">
+// ===== HDF5 Parser (DOM-free; doubles as the Web Worker body) =====
 // Reads two families of HDF5 files:
 //  A) Modern-style files (HDF5 1.8+ defaults): dataspace messages v2,
-//     contiguous v3 layouts, metadata stored as scalar string datasets
+//     contiguous v3 layouts, metadata as scalar string datasets
 //     (xunit/xlabel/xname/.../metadata) or attributes.
-//  B) IDL 7.0-style files (HDF5 1.6/1.7 era, e.g. IDL H5_* output):
-//     superblock v0/v1, old-style symbol-table groups (B-tree + SNOD +
-//     local heap), v1 object headers, v1 dataspace messages, and
-//     UPPERCASE metadata datasets (XUNIT/XLABEL/.../METADATA).
-// parse() tries the structural (spec-based) reader first and falls back to
-// the original heuristic byte-scan for anything it cannot decode.
+//  B) IDL 7.0-style files (HDF5 1.6/1.7 era): superblock v0/v1, old-style
+//     symbol-table groups (B-tree + SNOD + local heap), v1 object headers,
+//     v1 dataspace messages, UPPERCASE metadata datasets.
+// parse(): structural (spec-based, targeted reads) FIRST; heuristic whole-file
+// byte-scan as fallback. Hot paths optimised: zero-copy/bulk typed-array
+// element reads + single-pass metadata scan.
+const H5_IS_LE = (function () { try { return new Uint8Array(new Uint32Array([1]).buffer)[0] === 1; } catch (e) { return true; } })();
+const H5_MAX_VALUES = 1 << 24; // viewer cap ~16.7M values (134 MB as f64)
 class HDF5Parser {
   constructor(buffer) { this.raw = new Uint8Array(buffer); this.dv = new DataView(buffer); this.sso = 8; this.ssl = 8; }
   u16(off) { return this.dv.getUint16(off, true); }
   u32(off) { return this.dv.getUint32(off, true); }
   u64(off) { return this.dv.getUint32(off, true) + this.dv.getUint32(off + 4, true) * 0x100000000; }
   f64(off) { return this.dv.getFloat64(off, true); }
-  findString(str, start = 0) {
-    const t = new TextEncoder().encode(str);
-    for (let i = start; i <= this.raw.length - t.length; i++) {
-      let m = true; for (let j = 0; j < t.length; j++) { if (this.raw[i+j] !== t[j]) { m = false; break; } }
-      if (m) return i;
-    }
-    return -1;
-  }
   parse() {
     if (this.raw[0] !== 0x89 || this.raw[1] !== 0x48) throw new Error("Not HDF5");
-    // 1) fast byte-scan for modern-style files (dataspace v2 messages + contiguous layouts)
+    let structuralErr = null;
+    try { const res = this.parseStructural(); if (res) return res; }
+    catch (err) { structuralErr = err; }
     try { return this.extractData(); }
-    catch (err1) {
-      // 2) spec-based structural read for old-style files (IDL 7.0 / HDF5 1.6-era):
-      //    superblock v0/v1, symbol-table groups, v1 object headers, v1 dataspaces.
-      try {
-        const res = this.parseStructural();
-        if (res) return res;
-      } catch (err2) { console.warn("HDF5 structural parse failed: " + err2.message); }
-      throw new Error("Unrecognized HDF5 layout (neither modern-style nor IDL/old-style): " + err1.message);
+    catch (err) {
+      throw new Error("Unrecognized HDF5 layout (structural: " + (structuralErr ? structuralErr.message : "no match") + "; heuristic scan: " + err.message + ")");
     }
   }
-
-  // ----- structural (spec-based) reader: handles both file families -----
   findSuperblock() {
     const sig = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
     const spots = [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
@@ -182,7 +178,7 @@ class HDF5Parser {
         if (this.sso !== 8 || this.ssl !== 8) return null;
         return sb + 56;
       }
-      return null; // superblock v2/v3 (new-style root) -> use byte-scan fallback
+      return null; // superblock v2/v3 -> byte-scan fallback
     }
     return null;
   }
@@ -190,15 +186,13 @@ class HDF5Parser {
     if (this.raw[addr] !== 1) throw new Error("object header v" + this.raw[addr] + " (expected v1)");
     const msgs = [];
     let nmsg = this.u16(addr + 2); if (nmsg > 4096) nmsg = 4096;
-    // Messages are 8-byte aligned relative to the START OF THE CHUNK they live in,
-    // not to the absolute file address (some writers place headers at odd addresses).
     let chunkBase = addr, rel = 16, relEnd = 16 + this.u32(addr + 8);
     let count = 0, safety = 0;
     while (count < nmsg && safety++ < 512) {
       const pos = chunkBase + rel;
       if (rel + 8 > relEnd || pos + 8 > this.raw.length) break;
       const type = this.raw[pos];
-      if (type === 0x10) { // continuation block: message stream jumps to another chunk
+      if (type === 0x10) {
         const caddr = this.u64(pos + 8), clen = this.u64(pos + 8 + this.sso);
         if (!caddr || caddr >= this.raw.length || !clen || caddr + clen > this.raw.length + 8) break;
         chunkBase = caddr; rel = 0; relEnd = clen; continue;
@@ -220,22 +214,22 @@ class HDF5Parser {
   resolveHeapData(heap, nameOffsets) {
     const cands = [];
     const push = a => { if (a !== undefined && a !== null && a >= 0 && a < this.raw.length && cands.indexOf(a) === -1) cands.push(a); };
-    push(this.u64(heap + 8 + 2 * this.sso));          // field @+24 (seen in IDL/HDF5-1.6-era files: absolute address)
-    push(this.u64(heap + 16));                         // field @+16 as absolute address
-    push(heap + this.u64(heap + 16));                   // field @+16 as relative offset (modern layout)
-    push(heap + this.u64(heap + 8 + 2 * this.sso));    // field @+24 as relative offset
+    push(this.u64(heap + 8 + 2 * this.sso));
+    push(this.u64(heap + 16));
+    push(heap + this.u64(heap + 16));
+    push(heap + this.u64(heap + 8 + 2 * this.sso));
     if (!nameOffsets.length) return cands.length ? cands[0] : heap + 8;
     for (const c of cands) {
       let ok = true;
       for (const no of nameOffsets.slice(0, 24)) {
-        const s = this.heapStringPredirect(c, no);
+        const s = this.heapStringPredict(c, no);
         if (!this.isPrintableName(s)) { ok = false; break; }
       }
       if (ok) return c;
     }
     return cands.length ? cands[0] : heap + 8;
   }
-  heapStringPredirect(heapData, nameOff) {
+  heapStringPredict(heapData, nameOff) {
     const start = heapData + nameOff;
     if (start < 0 || start >= this.raw.length) return null;
     let end = start;
@@ -275,7 +269,7 @@ class HDF5Parser {
     try { msgs = this.readV1Messages(ohdr); } catch (err) { return; }
     let symTab = null;
     for (const m of msgs) if (m.type === 0x11) { symTab = m; break; }
-    if (symTab) { // old-style group: symbol table -> B-tree -> SNODs + local heap
+    if (symTab) {
       const bt = this.u64(symTab.body), heap = this.u64(symTab.body + this.sso);
       if (bt >= this.raw.length || heap + 2 * this.sso + 2 * this.ssl > this.raw.length) return;
       const snods = [];
@@ -319,24 +313,22 @@ class HDF5Parser {
   }
   decodeLayout(body) {
     const ver = this.raw[body], b1 = this.raw[body + 1];
-    if (ver === 3) { // modern (HDF5 1.8+): [ver][class][addr][size] or chunked
+    if (ver === 3) {
       const cls = b1;
       if (cls === 1) return { cls: 1, addr: this.u64(body + 2), size: this.u64(body + 10) };
       if (cls === 0) return { cls: 0, size: this.u32(body + 2), inlineOff: body + 6 };
       if (cls === 2) return { cls: 2 };
       throw new Error("unsupported data layout class " + cls);
     }
-    if (ver === 2) { // old HDF5 1.6-era: [ver][ndims incl element pseudo-dim][class][res 5][addr u64 @+8][sizes u32 @+16...]
+    if (ver === 2) { // old HDF5 1.6-era layout
       const nd = b1, cls = this.raw[body + 2];
       const sizes = [];
       for (let i = 0; i < nd && i < 32; i++) sizes.push(this.u32(body + 16 + 4 * i));
       let total = 1;
-      for (const s of sizes) total *= s; // dims incl. element size => exact byte size
+      for (const s of sizes) total *= s;
       if (cls === 1) return { cls: 1, addr: this.u64(body + 8), size: total || sizes[0] || 0 };
-      if (cls === 0) { // old compact: data stored inline right after the sizes
-        return { cls: 0, size: total || sizes[0] || 0, inlineOff: body + 16 + 4 * sizes.length };
-      }
-      if (cls === 2) return { cls: 2 }; // old chunked (via type-1 B-tree): not handled
+      if (cls === 0) return { cls: 0, size: total || sizes[0] || 0, inlineOff: body + 16 + 4 * sizes.length };
+      if (cls === 2) return { cls: 2 };
       throw new Error("unsupported old data layout class " + cls);
     }
     throw new Error("unsupported data layout v" + ver);
@@ -358,7 +350,7 @@ class HDF5Parser {
     const bf = this.u16(body + 1);
     return { cls: cls, size: size, orderLE: (bf & 1) === 0 };
   }
-  decodeAttribute(body, size) { // best-effort decode of attribute messages
+  decodeAttribute(body, size) {
     const ver = this.raw[body];
     if (ver < 1 || ver > 3) throw new Error("attr v" + ver);
     const pad = ver < 3;
@@ -405,7 +397,7 @@ class HDF5Parser {
       lay = this.decodeLayout(layout.body);
       dt = this.decodeDatatype(dtype.body, ds, lay);
     } catch (err) { return; }
-    if (lay.cls === 2) return; // chunked storage: not handled structurally
+    if (lay.cls === 2) return; // chunked: not handled structurally
     const d = { name: name, nd: ds.nd, dims: ds.dims, cls: dt.cls, elemSize: dt.size, orderLE: dt.orderLE, lay: lay, str: null, attrs: {} };
     for (const a of attrs) {
       try { const at = this.decodeAttribute(a.body, a.size); if (at && at.name) d.attrs[at.name] = at.value; } catch (err) {}
@@ -438,11 +430,11 @@ class HDF5Parser {
     }
     if (!arrDS) return null;
     const ny = arrDS.dims[0], nx = arrDS.dims[1];
-    if (ny < 1 || nx < 1 || ny * nx > 4e9 * 0.5) return null;
+    if (ny < 1 || nx < 1) return null;
+    if (ny * nx > H5_MAX_VALUES) throw new Error("2D dataset too large for this viewer (" + (ny * nx).toExponential(2) + " values; max " + H5_MAX_VALUES + ")");
     const isNum = d => d.cls === 1 || d.cls === 0;
     const xs = list.filter(d => d.nd === 1 && isNum(d) && d.dims[0] === nx);
     const ys = list.filter(d => d.nd === 1 && isNum(d) && d.dims[0] === ny);
-    const has = (d, c) => d.name && d.name.toLowerCase().indexOf(c) !== -1;
     const pick = (cands, prefs) => { for (const p of prefs) { const m = cands.find(d => d.name && p.test(d.name)); if (m) return m; } return cands.length ? cands[0] : null; };
     const xDS = pick(xs, [/^xaxis$/i, /x[ _-]?axis/i, /^x/i]);
     const yDS = pick(ys, [/^yaxis$/i, /y[ _-]?axis/i, /^y/i]);
@@ -456,10 +448,22 @@ class HDF5Parser {
     };
     for (const d of list) if (d.nd === 0 && d.cls === 3 && d.name) put(d.name.toLowerCase(), d.str);
     for (const d of [xDS, yDS, arrDS]) if (d && d.attrs) for (const k in d.attrs) put(k, d.attrs[k]);
+    // Bulk numeric reader: fast path reinterprets buffer directly as typed array.
     const readNum = (d, n) => {
       const off = d.lay.cls === 1 ? d.lay.addr : d.lay.inlineOff;
       const es = d.elemSize, le = d.orderLE;
-      if (off + es * n > this.raw.length) throw new Error("dataset data out of range");
+      if (off < 0 || off + es * n > this.raw.length) throw new Error("dataset data out of range");
+      if (H5_IS_LE && le && (d.cls === 0 || d.cls === 1)) {
+        if (es === 8 && off % 8 === 0) return new Float64Array(this.dv.buffer, off, n);
+        if (es === 4 && off % 4 === 0) {
+          const vals = new Float64Array(n);
+          if (d.cls === 1) { const s = new Float32Array(this.dv.buffer, off, n); for (let i = 0; i < n; i++) vals[i] = s[i]; }
+          else { const s = new Int32Array(this.dv.buffer, off, n); for (let i = 0; i < n; i++) vals[i] = s[i]; }
+          return vals;
+        }
+        if (es === 2 && off % 2 === 0) { const vals = new Float64Array(n); const s = new Int16Array(this.dv.buffer, off, n); for (let i = 0; i < n; i++) vals[i] = s[i]; return vals; }
+        if (es === 1) { const vals = new Float64Array(n); for (let i = 0; i < n; i++) vals[i] = this.raw[off + i]; return vals; }
+      }
       const vals = new Float64Array(n);
       for (let i = 0; i < n; i++) {
         const o = off + i * es;
@@ -488,8 +492,6 @@ class HDF5Parser {
       objectName: meta.objectName || "Data2d"
     };
   }
-
-  // ----- heuristic byte-scan reader (original method, kept as fallback) -----
   extractData() {
     const ds = [], lay = [];
     for (let i = 0; i < this.raw.length - 20; i++) {
@@ -506,51 +508,107 @@ class HDF5Parser {
     if (a1.dims[0]===aDS.dims[1] && a2.dims[0]===aDS.dims[0]) { xDS=a1; yDS=a2; }
     else if (a2.dims[0]===aDS.dims[1] && a1.dims[0]===aDS.dims[0]) { xDS=a2; yDS=a1; }
     else { xDS=a1; yDS=a2; }
-    const xa = this.readF64(xDS.addr, xDS.dims[0]), ya = this.readF64(yDS.addr, yDS.dims[0]);
-    const arr = this.readF64(aDS.addr, aDS.dims[0]*aDS.dims[1]);
+    const nMain = aDS.dims[0] * aDS.dims[1];
+    if (nMain > H5_MAX_VALUES) throw new Error("2D dataset too large for this viewer (" + nMain + " values; max " + H5_MAX_VALUES + ")");
+    const xa = this.readF64Bulk(xDS.addr, xDS.dims[0]), ya = this.readF64Bulk(yDS.addr, yDS.dims[0]);
+    const arr = this.readF64Bulk(aDS.addr, nMain);
     const meta = this.extractMetadata();
     return { xaxis:{values:xa, ...meta.xaxis}, yaxis:{values:ya, ...meta.yaxis}, array:{values:arr, dims:aDS.dims, ...meta.array}, objectName: meta.objectName || "Data2d" };
   }
-  readF64(addr, n) { const r = new Float64Array(n); for (let i=0; i<n; i++) r[i]=this.f64(addr+i*8); return r; }
+  readF64Bulk(addr, n) {
+    if (H5_IS_LE && addr >= 0 && addr % 8 === 0 && addr + 8 * n <= this.raw.length) return new Float64Array(this.dv.buffer, addr, n);
+    const r = new Float64Array(n); for (let i=0; i<n; i++) r[i]=this.f64(addr+i*8); return r;
+  }
   extractMetadata() {
+    // single O(filesize) pass for all attribute names (original rescanned once per name)
     const m = { xaxis:{name:'',label:'',unit:''}, yaxis:{name:'',label:'',unit:''}, array:{name:'',label:'',unit:''}, objectName:'' };
     const attrs = ['xunit','xlabel','xname','yunit','ylabel','yname','unit','label','name','metadata'];
-    for (const an of attrs) {
-      let idx = 0;
-      while ((idx = this.findString(an, idx)) !== -1) {
-        if (this.raw[idx-1] === an.length) {
-          const ohdrAddr = this.u64(idx+an.length);
-          if (ohdrAddr === 0 || ohdrAddr >= this.raw.length) { idx++; continue; }
-          let dataAddr = 0, dataSize = 0;
-          for (let i = ohdrAddr; i < Math.min(ohdrAddr + 300, this.raw.length - 20); i++) {
-            if (this.raw[i] === 0x03 && this.raw[i+1] === 0x01) {
-              dataAddr = this.u64(i + 2);
-              dataSize = this.u64(i + 10);
-              break;
-            }
-          }
-          if (dataAddr > 0 && dataSize > 0 && dataSize < 1000 && dataAddr + dataSize <= this.raw.length) {
-            const v = new TextDecoder().decode(this.raw.slice(dataAddr, dataAddr + dataSize));
-            if (an==='xunit') m.xaxis.unit=v; else if(an==='xlabel') m.xaxis.label=v;
-            else if(an==='xname') m.xaxis.name=v; else if(an==='yunit') m.yaxis.unit=v;
-            else if(an==='ylabel') m.yaxis.label=v; else if(an==='yname') m.yaxis.name=v;
-            else if(an==='unit') m.array.unit=v; else if(an==='label') m.array.label=v;
-            else if(an==='name') m.array.name=v; else if(an==='metadata') m.objectName=v;
-            break;
-          }
+    const byFirst = Object.create(null);
+    for (let k = 0; k < attrs.length; k++) {
+      const f = attrs[k].charCodeAt(0);
+      (byFirst[f] || (byFirst[f] = [])).push(attrs[k]);
+    }
+    const foundOnce = Object.create(null);
+    const raw = this.raw, len = raw.length;
+    for (let i = 1; i < len - 20; i++) {
+      const cands = byFirst[raw[i]];
+      if (!cands) continue;
+      let an = null;
+      for (let c = 0; c < cands.length; c++) {
+        const cand = cands[c];
+        let ok = true;
+        for (let j = 1; j < cand.length; j++) { if (raw[i + j] !== cand.charCodeAt(j)) { ok = false; break; } }
+        if (ok) { an = cand; break; }
+      }
+      if (!an || foundOnce[an]) continue;
+      if (raw[i - 1] !== an.length) continue;
+      const ohdrAddr = this.u64(i + an.length);
+      if (ohdrAddr === 0 || ohdrAddr >= len) continue;
+      let dataAddr = 0, dataSize = 0;
+      const lim = Math.min(ohdrAddr + 300, len - 20);
+      for (let p = ohdrAddr; p < lim; p++) {
+        if (raw[p] === 0x03 && raw[p + 1] === 0x01) {
+          dataAddr = this.u64(p + 2);
+          dataSize = this.u64(p + 10);
+          break;
         }
-        idx++;
+      }
+      if (dataAddr > 0 && dataSize > 0 && dataSize < 1000 && dataAddr + dataSize <= len) {
+        const v = new TextDecoder().decode(raw.subarray(dataAddr, dataAddr + dataSize));
+        if (an==='xunit') m.xaxis.unit=v; else if(an==='xlabel') m.xaxis.label=v;
+        else if(an==='xname') m.xaxis.name=v; else if(an==='yunit') m.yaxis.unit=v;
+        else if(an==='ylabel') m.yaxis.label=v; else if(an==='yname') m.yaxis.name=v;
+        else if(an==='unit') m.array.unit=v; else if(an==='label') m.array.label=v;
+        else if(an==='name') m.array.name=v; else if(an==='metadata') m.objectName=v;
+        foundOnce[an] = true;
       }
     }
     return m;
   }
 }
-
-// ===== IndexedDB =====
-let idb;
-function getDB() { return new Promise((res) => { if (idb) return res(idb); const req = indexedDB.open('hdf5viewer_db', 1); req.onupgradeneeded = () => req.result.createObjectStore('handles'); req.onsuccess = () => { idb = req.result; res(idb); }; }); }
-async function saveHandle(handle) { const db = await getDB(); return new Promise((res) => { const tx = db.transaction('handles', 'readwrite'); tx.objectStore('handles').put(handle, 'lastFile'); tx.oncomplete = res; }); }
-async function loadHandle() { const db = await getDB(); return new Promise((res) => { const tx = db.transaction('handles', 'readonly'); const req = tx.objectStore('handles').get('lastFile'); req.onsuccess = () => res(req.result); req.onerror = () => res(null); }); }
+</script>
+<script id="app-src">
+// ===== Web Worker bootstrap (off-main-thread HDF5 parsing) =====
+function makeParseWorkerURL() {
+  const src = document.getElementById('hdf5-parser-src').textContent;
+  const boot = [
+    "self.onmessage = function(ev) {",
+    "  try {",
+    "    const res = new HDF5Parser(ev.data.buffer).parse();",
+    "    const cp = function(ta) { const out = new Float64Array(ta.length); for (var i = 0; i < ta.length; i++) out[i] = ta[i]; return out; };",
+    "    const r = { objectName: res.objectName,",
+    "      xaxis: { values: cp(res.xaxis.values), name: res.xaxis.name, label: res.xaxis.label, unit: res.xaxis.unit },",
+    "      yaxis: { values: cp(res.yaxis.values), name: res.yaxis.name, label: res.yaxis.label, unit: res.yaxis.unit },",
+    "      array: { values: cp(res.array.values), dims: res.array.dims, name: res.array.name, label: res.array.label, unit: res.array.unit } };",
+    "    self.postMessage({ ok: true, result: r },",
+    "      [r.xaxis.values.buffer, r.yaxis.values.buffer, r.array.values.buffer]);",
+    "  } catch (err) { self.postMessage({ ok: false, error: (err && err.message) ? err.message : String(err) }); }",
+    "};"
+  ].join("\n");
+  return URL.createObjectURL(new Blob([src, "\n", boot], { type: "application/javascript" }));
+}
+let parseWorker = null, workerURL = null; // parseWorker null = uninitialised, false = unavailable
+function getParseWorker() {
+  if (parseWorker !== null) return parseWorker;
+  try {
+    workerURL = makeParseWorkerURL();
+    parseWorker = new Worker(workerURL);
+  } catch (e) { parseWorker = false; }
+  return parseWorker;
+}
+function parseInWorker(buffer) {
+  const w = getParseWorker();
+  if (!w) return Promise.resolve().then(function() { return new HDF5Parser(buffer).parse(); }); // graceful fallback
+  return new Promise(function(resolve, reject) {
+    w.onmessage = function(ev) {
+      if (workerURL) { try { URL.revokeObjectURL(workerURL); workerURL = null; } catch (e) {} }
+      if (ev.data && ev.data.ok) resolve(ev.data.result);
+      else reject(new Error(ev.data && ev.data.error ? ev.data.error : "parse failed"));
+    };
+    w.onerror = function(e) { reject(new Error(e.message || "Worker error")); };
+    w.postMessage({ buffer: buffer }, [buffer]); // transfer: no copy of the file bytes
+  });
+}
 
 // ===== Theme =====
 let isDarkMode = false;
@@ -560,28 +618,42 @@ function toggleTheme() {
   document.body.classList.toggle('dark-mode', isDarkMode);
   document.getElementById('themeBtn').textContent = isDarkMode ? '☀️' : '🌙';
   try { localStorage.setItem('hdf5_theme', isDarkMode ? 'dark' : 'light'); } catch(e) {}
-  redrawAll();
+  schedule({ heat: true, profiles: true, colorbar: true, cross: (crossPx ? lastHoverPt : null) });
 }
 function initTheme() {
   try { const t = localStorage.getItem('hdf5_theme'); if (t === 'dark') { isDarkMode = true; document.body.classList.add('dark-mode'); document.getElementById('themeBtn').textContent = '☀️'; } } catch(e) {}
 }
-function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
 
-// ===== State =====
+// ===== State & DOM (queried once) =====
 let currentData = null, currentColormap = 'inferno', invertColormap = false;
 let view = null, colorScale = null, dataMin = 0, dataMax = 1;
 let isPanning = false, panLastX = 0, panLastY = 0;
 let cbDragging = null, cbHandlePos = { minX: 0, maxX: 0 };
 const cbLayout = { padL: 45, padR: 15, barY: 8, barH: 16, h: 95 };
 let touchMode = null, touchLastX = 0, touchLastY = 0, lastPinchDist = 0;
+let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
 
-let canvas = document.getElementById('heatmapCanvas');
-let ctx = canvas.getContext('2d');
-let hPC = document.getElementById('hProfileCanvas'), hCtx = hPC.getContext('2d');
-let vPC = document.getElementById('vProfileCanvas'), vCtx = vPC.getContext('2d');
-let cbC = document.getElementById('colorbar'), cbCtx = cbC.getContext('2d');
-let heatBuf = document.createElement('canvas'), heatBufCtx = heatBuf.getContext('2d');
+const canvas = document.getElementById('heatmapCanvas');
+const ctx = canvas.getContext('2d');
+const ovl = document.getElementById('overlayCanvas');
+const octx = (function () { try { return ovl.getContext('2d', { desynchronized: true }); } catch (err) { return ovl.getContext('2d'); } })();
+const hPC = document.getElementById('hProfileCanvas'), hCtx = hPC.getContext('2d');
+const vPC = document.getElementById('vProfileCanvas'), vCtx = vPC.getContext('2d');
+const cbC = document.getElementById('colorbar'), cbCtx = cbC.getContext('2d');
+const heatBuf = document.createElement('canvas'), heatBufCtx = heatBuf.getContext('2d');
+const cursorTextEl = document.getElementById('cursorText');
+const fileInfoEl = document.getElementById('fileInfo');
+const statusEl = document.getElementById('status');
+const zminEl = document.getElementById('zminInput'), zmaxEl = document.getElementById('zmaxInput');
+const plotAreaEl = document.getElementById('plotArea');
 let plotGeo = null;
+
+// Cached element rects: avoids getBoundingClientRect() (forced layout) per mousemove
+let canvasRect = null, cbRect = null;
+function refreshRects() {
+  try { canvasRect = canvas.getBoundingClientRect(); cbRect = cbC.getBoundingClientRect(); }
+  catch (e) { canvasRect = null; cbRect = null; }
+}
 
 const margin = { top: 15, right: 20, bottom: 60, left: 70 };
 
@@ -593,32 +665,115 @@ const colormaps = {
   diverging: [[0,0,102],[50,50,153],[102,102,204],[178,178,229],[255,255,255],[229,178,178],[204,102,102],[153,50,50],[102,0,0]]
 };
 
-function getColor(t) {
-  if (invertColormap) t = 1 - t;
-  t = Math.max(0, Math.min(1, t));
+// ===== Colormap LUT: 256-entry table packed as ABGR u32 for 32-bit writes =====
+const NAN_COLOR = (255 << 24) | (97 << 16) | (97 << 8) | 26; // distinct dark blue-grey for NaN
+let cbarVersion = 0, cbarStrip = null, cbarStripKey = null;
+let lut = new Uint32Array(256);
+function buildLUT() {
   const c = colormaps[currentColormap];
-  const i = Math.floor(t * (c.length - 1)), f = t * (c.length - 1) - i;
-  const a = c[i], b = c[Math.min(i + 1, c.length - 1)];
-  return [Math.round(a[0]+(b[0]-a[0])*f), Math.round(a[1]+(b[1]-a[1])*f), Math.round(a[2]+(b[2]-a[2])*f)];
+  for (let i = 0; i < 256; i++) {
+    let t = i / 255;
+    if (invertColormap) t = 1 - t;
+    const pos = t * (c.length - 1);
+    const idx = Math.floor(pos), f = pos - idx;
+    const a = c[idx], b = c[Math.min(idx + 1, c.length - 1)];
+    const r = Math.round(a[0] + (b[0] - a[0]) * f);
+    const g = Math.round(a[1] + (b[1] - a[1]) * f);
+    const bl = Math.round(a[2] + (b[2] - a[2]) * f);
+    lut[i] = (255 << 24) | (bl << 16) | (g << 8) | r;
+  }
+  cbarVersion++;
 }
 function fmt(v) { if (Math.abs(v) < 1e-4 && v !== 0) return v.toExponential(1); return parseFloat(v.toFixed(3)).toString(); }
 function niceTicks(min, max, count) {
-  const range = max - min; if (range <= 0) return [min];
-  const rough = range / count, exp = Math.floor(Math.log10(rough)), frac = rough / Math.pow(10, exp);
-  let nf; if (frac < 1.5) nf = 1; else if (frac < 3) nf = 2; else if (frac < 7) nf = 5; else nf = 10;
-  const step = nf * Math.pow(10, exp), nMin = Math.ceil(min / step) * step, nMax = Math.floor(max / step) * step;
-  const ticks = []; for (let v = nMin; v <= nMax + step * 0.5; v += step) ticks.push(parseFloat(v.toPrecision(12)));
+  // Float-safe tick generator. The original accumulated `v += step`, which
+  // loops FOREVER (hard page freeze) when step is smaller than 1 ULP at the
+  // axis magnitude - e.g. epoch-second timestamps with a microsecond window,
+  // or subnormal axes where step underflows to 0. This version always floors
+  // the step at 4 ULP, walks by INDEX (no accumulation), and caps output at
+  // 401 ticks, so it is structurally incapable of hanging.
+  if (!isFinite(min) || !isFinite(max)) return [];
+  const lo0 = Math.min(min, max), hi0 = Math.max(min, max);
+  const range = max - min;
+  if (!isFinite(range)) return [lo0, hi0];
+  if (!(range > 0)) return [min];
+  const rough = range / count;
+  if (!(rough > 0)) return [lo0, hi0];
+  const lg = Math.log10(rough);
+  if (!isFinite(lg)) return [lo0, hi0];
+  const exp = Math.floor(lg);
+  const pow10 = (exp >= -323 && exp <= 308) ? Math.pow(10, exp) : 0;
+  let frac = pow10 > 0 ? rough / pow10 : 0;
+  if (!isFinite(frac) || frac < 1 || frac > 10) frac = 5;
+  const nf = frac < 1.5 ? 1 : (frac < 3 ? 2 : (frac < 7 ? 5 : 10));
+  let step = nf * pow10;
+  const mag = min !== 0 ? Math.abs(min) : Math.abs(range);
+  const ulpExp = Math.floor(Math.log2(mag)) - 52;
+  const ulp = ulpExp >= -1074 ? Math.pow(2, ulpExp) : 0;
+  const minStep = ulp * 4;
+  if (!(step > 0) || step < minStep) step = minStep;
+  if (!(step > 0) || !isFinite(step)) return [lo0, hi0];
+  const nMin = Math.ceil(min / step) * step;
+  const nMax = Math.floor(max / step) * step;
+  if (!isFinite(nMin) || !isFinite(nMax) || nMax < nMin) return [lo0, hi0];
+  const span = (nMax - nMin) / step;
+  if (!isFinite(span) || span < 0) return [lo0, hi0];
+  let n = Math.round(span);
+  if (!isFinite(n) || n < 0) return [lo0, hi0];
+  if (n > 400) n = 400;
+  const ticks = [];
+  for (let k = 0; k <= n; k++) ticks.push(parseFloat((nMin + k * step).toPrecision(12)));
   return ticks;
 }
 
-// ===== Rendering =====
+// ===== rAF render scheduler: one frame per batch, no matter how many events fire =====
+let rafId = 0;
+let dirtyHeat = false, dirtyRecolor = false, dirtyProfiles = false, dirtyColorbar = false, dirtyOverlay = false, dirtyCursor = false;
+let pendingCross = null;  // {fi, fj} for tick-time overlay redraws (theme change/resize), or null
+let pendingCursor = null; // {cx, cy, fi, fj} for the cursor info line
+let cursorIdx = { cx: -1, cy: -1 };
+let profileState = null;  // {key, cx, cy} of the last drawn profiles
+let crossPx = null;       // whether a crosshair is currently shown
+let lastHoverPt = null;   // {fi,fj} the crosshair was drawn for
+
+function schedule(opt) {
+  if (opt.recolor) { dirtyRecolor = true; dirtyHeat = true; }
+  if (opt.heat) dirtyHeat = true;
+  if (opt.profiles) dirtyProfiles = true;
+  if (opt.colorbar) dirtyColorbar = true;
+  if (opt.forceProfiles) { dirtyProfiles = true; profileState = null; }
+  if ('cross' in opt) { dirtyOverlay = true; pendingCross = opt.cross; }
+  if ('cursor' in opt) { dirtyCursor = true; if (opt.cursor) pendingCursor = opt.cursor; }
+  if (!rafId) rafId = requestAnimationFrame(tick);
+}
+function tick() {
+  rafId = 0;
+  if (!currentData || !plotGeo || !view) { dirtyHeat = dirtyRecolor = dirtyProfiles = dirtyColorbar = dirtyOverlay = dirtyCursor = false; pendingCross = null; pendingCursor = null; return; }
+  if (dirtyRecolor) renderHeatBuffer();
+  if (dirtyHeat) drawHeatmapWithAxes();
+  if (dirtyProfiles) drawProfilesIfNeeded(cursorIdx.cx, cursorIdx.cy);
+  if (dirtyColorbar) drawColorbar();
+  if (dirtyOverlay) { drawOverlayNow(pendingCross); pendingCross = null; }
+  if (dirtyCursor && pendingCursor) setCursorText(pendingCursor);
+  dirtyHeat = dirtyRecolor = dirtyProfiles = dirtyColorbar = dirtyOverlay = dirtyCursor = false;
+  pendingCursor = null;
+}
+
+// ===== Heat buffer recolour: reusable ImageData + U32 writes + NaN-safe LUT =====
+let heatImg = null, heatU32 = null;
 function renderHeatBuffer() {
-  if (!currentData) return;
-  const { array } = currentData; const nx = array.dims[1], ny = array.dims[0];
-  const img = heatBufCtx.createImageData(nx, ny);
-  const range = colorScale.max - colorScale.min || 1;
-  for (let y = 0; y < ny; y++) { for (let x = 0; x < nx; x++) { const v = array.values[y * nx + x]; const t = (v - colorScale.min) / range; const [r, g, b] = getColor(t); const p = (y * nx + x) * 4; img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=255; } }
-  heatBufCtx.putImageData(img, 0, 0);
+  if (!currentData || !heatImg) return;
+  const vals = currentData.array.values;
+  const min = colorScale.min, inv = 1 / ((colorScale.max - colorScale.min) || 1);
+  const u32 = heatU32, L = lut, NC = NAN_COLOR;
+  for (let k = 0; k < vals.length; k++) {
+    const v = vals[k];
+    if (v !== v) { u32[k] = NC; continue; } // NaN -> distinct colour, no crash
+    let t = (v - min) * inv;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    u32[k] = L[(t * 255) | 0];
+  }
+  heatBufCtx.putImageData(heatImg, 0, 0);
 }
 
 function indexToX(i) { const { xaxis } = currentData; const nx = xaxis.values.length; const fi = Math.max(0, Math.min(nx - 1, i)); const li = Math.floor(fi), hi = Math.min(nx - 1, li + 1), f = fi - li; return xaxis.values[li] * (1 - f) + xaxis.values[hi] * f; }
@@ -629,21 +784,27 @@ function drawHeatmapWithAxes() {
   const theme = getTheme();
   const axisCol = theme==='dark' ? '#c9d1d9' : '#333333';
   const bgCol = theme==='dark' ? '#0d1117' : '#ffffff';
-  const tickCol = axisCol;
   const { ox, oy, dw, dh } = plotGeo;
   const { i0, i1, j0, j1 } = view;
-  ctx.fillStyle = bgCol; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const cw = canvas.width / dpr, ch = canvas.height / dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = bgCol; ctx.fillRect(0, 0, cw, ch);
+  const sw = i1 - i0 + 1, sh = j1 - j0 + 1;
+  // nearest-neighbour when magnifying; hardware averaging only when minifying heavily
+  ctx.imageSmoothingEnabled = dw / sw < 0.5 || dh / sh < 0.5;
+  ctx.drawImage(heatBuf, i0, j0, sw, sh, ox, oy, dw, dh);
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(heatBuf, i0, j0, i1 - i0 + 1, j1 - j0 + 1, ox, oy, dw, dh);
   ctx.strokeStyle = axisCol; ctx.lineWidth = 1; ctx.strokeRect(ox + 0.5, oy + 0.5, dw, dh);
   const xMin = indexToX(i0), xMax = indexToX(i1), yMin = indexToY(j0), yMax = indexToY(j1);
   const xT = niceTicks(xMin, xMax, 8), yT = niceTicks(yMin, yMax, 8);
   const nx = currentData.array.dims[1], ny = currentData.array.dims[0];
-  ctx.fillStyle = tickCol; ctx.strokeStyle = tickCol; ctx.lineWidth = 1; ctx.font = '12px Arial';
+  const xden = (currentData.xaxis.values[nx-1] - currentData.xaxis.values[0]) || 1;
+  const yden = (currentData.yaxis.values[ny-1] - currentData.yaxis.values[0]) || 1;
+  ctx.fillStyle = axisCol; ctx.strokeStyle = axisCol; ctx.lineWidth = 1; ctx.font = '12px Arial';
   const tickLen = 5;
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   for (const tv of xT) {
-    const fi = (tv - currentData.xaxis.values[0]) / (currentData.xaxis.values[nx-1] - currentData.xaxis.values[0]) * (nx - 1);
+    const fi = (tv - currentData.xaxis.values[0]) / xden * (nx - 1);
     const px = ox + ((fi - i0) / (i1 - i0)) * dw;
     if (px < ox - 1 || px > ox + dw + 1) continue;
     ctx.beginPath(); ctx.moveTo(px, oy + dh); ctx.lineTo(px, oy + dh - tickLen); ctx.stroke();
@@ -654,7 +815,7 @@ function drawHeatmapWithAxes() {
   ctx.fillText((currentData.xaxis.label||'X') + (currentData.xaxis.unit ? ` (${currentData.xaxis.unit})` : ''), ox + dw/2, oy + dh + 35);
   ctx.font = '12px Arial'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (const tv of yT) {
-    const fj = (tv - currentData.yaxis.values[0]) / (currentData.yaxis.values[ny-1] - currentData.yaxis.values[0]) * (ny - 1);
+    const fj = (tv - currentData.yaxis.values[0]) / yden * (ny - 1);
     const py = oy + dh - ((fj - j0) / (j1 - j0)) * dh;
     if (py < oy - 1 || py > oy + dh + 1) continue;
     ctx.beginPath(); ctx.moveTo(ox, py); ctx.lineTo(ox + tickLen, py); ctx.stroke();
@@ -667,23 +828,56 @@ function drawHeatmapWithAxes() {
   ctx.restore();
 }
 
+// ===== Overlay crosshair =====
+// The crosshair is POINTER-CRITICAL UI: on mousemove/wheel it is drawn
+// synchronously inside the event handler itself (clear + 2 lines < 0.1 ms), so
+// it can NEVER be delayed or starved by the batched heavy work that runs at
+// most once per rAF frame.
+function drawCrosshairLines(fi, fj) {
+  const theme = getTheme();
+  const { ox, oy, dw, dh } = plotGeo;
+  const px = ox + ((fi - view.i0) / (view.i1 - view.i0)) * dw;
+  const py = oy + ((fj - view.j0) / (view.j1 - view.j0)) * dh;
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.strokeStyle = theme==='dark' ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.4)';
+  octx.lineWidth = 1;
+  octx.beginPath(); octx.moveTo(px, oy); octx.lineTo(px, oy + dh); octx.moveTo(ox, py); octx.lineTo(ox + dw, py); octx.stroke();
+}
+// c: {fi, fj} to draw, or null to clear.
+function drawOverlayNow(c) {
+  if (!plotGeo || !view) return;
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, ovl.width, ovl.height);
+  if (c) { drawCrosshairLines(c.fi, c.fj); lastHoverPt = { fi: c.fi, fj: c.fj }; crossPx = 1; }
+  else { crossPx = null; lastHoverPt = null; }
+}
+
 function drawColorbar() {
   const theme = getTheme();
   const axisCol = theme==='dark' ? '#c9d1d9' : '#333333';
   const bgCol = theme==='dark' ? '#0d1117' : '#ffffff';
   const W = cbC.clientWidth || 300;
   const H = cbLayout.h;
-  cbC.width = W; cbC.height = H;
-  cbCtx.fillStyle = bgCol; cbCtx.fillRect(0, 0, W, H);
+  const bw = Math.max(1, Math.round(W * dpr)), bh = Math.max(1, Math.round(H * dpr));
+  if (cbC.width !== bw || cbC.height !== bh) { cbC.width = bw; cbC.height = bh; }
   const barW = W - cbLayout.padL - cbLayout.padR;
   const barX = cbLayout.padL, barY = cbLayout.barY, barH = cbLayout.barH;
-  const img = cbCtx.createImageData(barW, barH);
-  for (let x = 0; x < barW; x++) {
-    const [r, g, b] = getColor(x / (barW - 1));
-    for (let y = 0; y < barH; y++) { const p = (y * barW + x) * 4; img.data[p]=r; img.data[p+1]=g; img.data[p+2]=b; img.data[p+3]=255; }
+  // cached gradient strip at device resolution; rebuilt only when size/colormap/dpr changes
+  const key = cbarVersion + '|' + barW + '|' + barH + '|' + dpr;
+  if (cbarStripKey !== key) {
+    const barWdev = Math.max(1, Math.round(barW * dpr)), barHdev = Math.max(1, Math.round(barH * dpr));
+    const img = new ImageData(barWdev, barHdev);
+    const u32 = new Uint32Array(img.data.buffer);
+    for (let x = 0; x < barWdev; x++) {
+      const col = lut[Math.round((x / (barWdev - 1)) * 255)];
+      for (let y = 0; y < barHdev; y++) u32[y * barWdev + x] = col;
+    }
+    cbarStrip = img; cbarStripKey = key;
   }
-  cbCtx.putImageData(img, barX, barY);
-  cbCtx.strokeStyle = axisCol; cbCtx.lineWidth = 1; cbCtx.strokeRect(barX + 0.5, barY + 0.5, barW, barH);
+  cbCtx.setTransform(1, 0, 0, 1, 0, 0);
+  cbCtx.fillStyle = bgCol; cbCtx.fillRect(0, 0, cbC.width, cbC.height);
+  cbCtx.putImageData(cbarStrip, Math.round(barX * dpr), Math.round(barY * dpr));
+  cbCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const range = dataMax - dataMin || 1;
   const minFrac = (colorScale.min - dataMin) / range;
   const maxFrac = (colorScale.max - dataMin) / range;
@@ -700,8 +894,9 @@ function drawColorbar() {
   }
   drawHandle(minPx, minHandleCol);
   drawHandle(maxPx, maxHandleCol);
+  cbCtx.strokeStyle = axisCol; cbCtx.lineWidth = 1;
   const ticks = niceTicks(colorScale.min, colorScale.max, 5);
-  cbCtx.fillStyle = axisCol; cbCtx.strokeStyle = axisCol;
+  cbCtx.fillStyle = axisCol;
   cbCtx.font = '11px Arial'; cbCtx.textAlign = 'center'; cbCtx.textBaseline = 'top';
   for (const tv of ticks) {
     const frac = (tv - colorScale.min) / (colorScale.max - colorScale.min || 1);
@@ -717,14 +912,30 @@ function drawColorbar() {
   cbCtx.fillText(`max: ${colorScale.max.toExponential(3)}`, W - 2, H - 14);
 }
 
+// ===== Profiles: zero-copy row view, reused column scratch, cached plots =====
+let colScratch = null, profileBuckets = null;
+function drawProfilesIfNeeded(cx, cy) {
+  if (!currentData || !view) return;
+  const ny = currentData.array.dims[0], nx = currentData.array.dims[1];
+  if (cx < 0 || cx >= nx || cy < 0 || cy >= ny) return;
+  const key = view.i0 + '|' + view.i1 + '|' + view.j0 + '|' + view.j1;
+  if (profileState && profileState.key === key && profileState.cx === cx && profileState.cy === cy) return;
+  profileState = { key: key, cx: cx, cy: cy };
+  drawProfiles(cx, cy);
+}
 function drawProfiles(xi, yi) {
   if (!currentData || !view) return;
-  const { xaxis, yaxis, array } = currentData; const ny = array.dims[0], nx = array.dims[1];
+  const { xaxis, yaxis, array } = currentData;
+  const ny = array.dims[0], nx = array.dims[1];
   const ci = Math.max(0, Math.min(nx - 1, xi)), cj = Math.max(0, Math.min(ny - 1, yi));
+  const vals = array.values;
+  const xRow = vals.subarray(cj * nx, cj * nx + nx); // zero-copy row (was Array.from per mousemove)
+  if (!colScratch || colScratch.length !== ny) colScratch = new Float64Array(ny); // reused column buffer
+  for (let i = 0; i < ny; i++) colScratch[i] = vals[i * nx + ci];
   const xMinView = indexToX(view.i0), xMaxView = indexToX(view.i1);
-  drawProfile(hCtx, hPC, xaxis.values, Array.from({length: nx}, (_, i) => array.values[cj * nx + i]), xaxis.label || 'X', xaxis.unit || '', array.label || 'Z', array.unit || '', cj, yaxis.values[cj], yaxis.label || 'Y', xMinView, xMaxView);
+  drawProfile(hCtx, hPC, xaxis.values, xRow, xaxis.label || 'X', xaxis.unit || '', array.label || 'Z', array.unit || '', cj, yaxis.values[cj], yaxis.label || 'Y', xMinView, xMaxView);
   const yMinView = indexToY(view.j0), yMaxView = indexToY(view.j1);
-  drawProfile(vCtx, vPC, yaxis.values, Array.from({length: ny}, (_, i) => array.values[i * nx + ci]), yaxis.label || 'Y', yaxis.unit || '', array.label || 'Z', array.unit || '', ci, xaxis.values[ci], xaxis.label || 'X', yMinView, yMaxView);
+  drawProfile(vCtx, vPC, yaxis.values, colScratch, yaxis.label || 'Y', yaxis.unit || '', array.label || 'Z', array.unit || '', ci, xaxis.values[ci], xaxis.label || 'X', yMinView, yMaxView);
 }
 
 function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, sliceIdx, sliceVal, sliceAxisLabel, viewMin, viewMax) {
@@ -734,26 +945,53 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
   const gridCol = theme==='dark' ? '#21262d' : '#e0e0e0';
   const lineCol = theme==='dark' ? '#58a6ff' : '#000000';
   const sliceCol = theme==='dark' ? '#ff6b6b' : '#d62728';
-  const w = pcanvas.clientWidth, h = pcanvas.clientHeight;
-  pcanvas.width = w; pcanvas.height = h;
+  const w = pcanvas.clientWidth || 1, h = pcanvas.clientHeight || 1;
+  const bw = Math.max(1, Math.round(w * dpr)), bh = Math.max(1, Math.round(h * dpr));
+  if (pcanvas.width !== bw || pcanvas.height !== bh) { pcanvas.width = bw; pcanvas.height = bh; }
+  pctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   pctx.fillStyle = bgCol; pctx.fillRect(0, 0, w, h);
-  if (!yData || yData.length === 0) return;
+  const n = yData.length;
+  if (!n) return;
   const pm = { top: 25, right: 15, bottom: 55, left: 60 };
   const pw = w - pm.left - pm.right, ph = h - pm.top - pm.bottom;
-  if (ph < 10) return;
-  let yMin = Infinity, yMax = -Infinity;
-  for (const v of yData) { if (v < yMin) yMin = v; if (v > yMax) yMax = v; }
-  const yRange = yMax - yMin || 1; const yPad = yRange * 0.08; yMin -= yPad; yMax += yPad; const yRangeP = yMax - yMin || 1;
+  if (pw < 10 || ph < 10) return;
   const xMin = viewMin !== undefined ? viewMin : xAxis[0];
-  const xMax = viewMax !== undefined ? viewMax : xAxis[xAxis.length - 1];
-  const xRange = xMax - xMin || 1;
+  const xMax = viewMax !== undefined ? viewMax : xAxis[n - 1];
+  const xRange = (xMax - xMin) || 1;
+
+  // min/max decimation: one bucket per pixel column (O(n) once per redraw, ~2*plotWidth segments drawn)
+  const nb = Math.min(16384, Math.max(2, Math.ceil(pw) + 1));
+  if (!profileBuckets || profileBuckets.bX.length !== nb) profileBuckets = { bX: new Float64Array(nb), bMin: new Float64Array(nb), bMax: new Float64Array(nb) };
+  const bX = profileBuckets.bX, bMin = profileBuckets.bMin, bMax = profileBuckets.bMax;
+  bX.fill(0);
+  const direct = n <= nb * 2; // few points -> draw exact polyline
+  const x0 = pm.left, x1 = pm.left + pw;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const xv = xAxis[i];
+    if (xv < xMin || xv > xMax) continue;
+    const px = x0 + ((xv - xMin) / xRange) * pw;
+    const v = yData[i];
+    if (v !== v || v === Infinity || v === -Infinity) continue; // NaN/Inf skipped, not poisoning the axis
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (direct) continue;
+    const b = (px - x0) | 0;
+    if (b < 0 || b >= nb) continue;
+    if (!bX[b]) { bX[b] = px; bMin[b] = v; bMax[b] = v; }
+    else { if (v < bMin[b]) bMin[b] = v; if (v > bMax[b]) bMax[b] = v; }
+  }
+  if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+  let yMin = lo, yMax = hi;
+  const yRange = yMax - yMin || 1; const yPad = yRange * 0.08; yMin -= yPad; yMax += yPad; const yRangeP = yMax - yMin || 1;
+
   pctx.fillStyle = bgCol; pctx.fillRect(pm.left, pm.top, pw, ph);
   pctx.strokeStyle = gridCol; pctx.lineWidth = 0.5;
   const yTicks = niceTicks(yMin, yMax, 4), xTicks = niceTicks(xMin, xMax, 5);
   for (const tv of yTicks) { const py = pm.top + ph - ((tv - yMin) / yRangeP) * ph; if (py < pm.top || py > pm.top + ph) continue; pctx.beginPath(); pctx.moveTo(pm.left, py); pctx.lineTo(pm.left + pw, py); pctx.stroke(); }
   for (const tv of xTicks) { const px = pm.left + ((tv - xMin) / xRange) * pw; if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + ph); pctx.stroke(); }
   pctx.strokeStyle = axisCol; pctx.lineWidth = 1; pctx.strokeRect(pm.left + 0.5, pm.top + 0.5, pw, ph);
-  pctx.fillStyle = axisCol; pctx.lineWidth = 1;
+  pctx.fillStyle = axisCol;
   const tickLen = 4;
   pctx.font = '11px Arial'; pctx.textAlign = 'center'; pctx.textBaseline = 'top';
   for (const tv of xTicks) { const px = pm.left + ((tv - xMin) / xRange) * pw; if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top + ph); pctx.lineTo(px, pm.top + ph - tickLen); pctx.stroke(); pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + tickLen); pctx.stroke(); pctx.fillText(fmt(tv), px, pm.top + ph + 6); }
@@ -766,55 +1004,104 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
   pctx.font = '12px Arial'; pctx.fillStyle = sliceCol; pctx.textAlign = 'left'; pctx.textBaseline = 'top';
   pctx.fillText(`${sliceAxisLabel} = ${fmt(sliceVal)}`, pm.left + 2, 4);
   pctx.save(); pctx.beginPath(); pctx.rect(pm.left, pm.top, pw, ph); pctx.clip();
-  pctx.strokeStyle = lineCol; pctx.lineWidth = 2; pctx.beginPath();
-  for (let i = 0; i < yData.length; i++) { const px = pm.left + ((xAxis[i] - xMin) / xRange) * pw; const py = pm.top + ph - ((yData[i] - yMin) / yRangeP) * ph; if (i === 0) pctx.moveTo(px, py); else pctx.lineTo(px, py); }
+  pctx.strokeStyle = lineCol; pctx.lineWidth = n > 20000 ? 1 : 1.5; pctx.beginPath();
+  let started = false;
+  if (direct) {
+    for (let i = 0; i < n; i++) {
+      const xv = xAxis[i];
+      if (xv < xMin || xv > xMax) continue;
+      const v = yData[i];
+      if (v !== v || v === Infinity || v === -Infinity) continue;
+      const px = pm.left + ((xv - xMin) / xRange) * pw;
+      const py = pm.top + ph - ((v - yMin) / yRangeP) * ph;
+      if (!started) { pctx.moveTo(px, py); started = true; } else pctx.lineTo(px, py);
+    }
+  } else {
+    for (let b = 0; b < nb; b++) {
+      if (!bX[b]) continue;
+      const pxC = bX[b];
+      const pLo = pm.top + ph - ((bMin[b] - yMin) / yRangeP) * ph;
+      const pHi = pm.top + ph - ((bMax[b] - yMin) / yRangeP) * ph;
+      if (!started) { pctx.moveTo(pxC, pLo); pctx.lineTo(pxC, pHi); started = true; }
+      else { pctx.lineTo(pxC, pLo); pctx.lineTo(pxC, pHi); }
+    }
+  }
   pctx.stroke(); pctx.restore();
 }
 
-// ===== Responsive =====
-function redrawAll() {
-  if (currentData && plotGeo && view) {
-    drawHeatmapWithAxes();
-    drawProfiles(Math.floor((view.i0+view.i1)/2), Math.floor((view.j0+view.j1)/2));
-    drawColorbar();
-  }
-}
+// ===== Responsive / DPR-aware sizing (single ResizeObserver, rAF-debounced) =====
 function resizeCanvases() {
-  if (plotGeo) {
-    const area = document.getElementById('plotArea');
-    canvas.width = area.clientWidth; canvas.height = area.clientHeight;
-    plotGeo.dw = canvas.width - margin.left - margin.right;
-    plotGeo.dh = canvas.height - margin.top - margin.bottom;
-    redrawAll();
-  }
+  dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const cw = Math.max(1, canvas.clientWidth), ch = Math.max(1, canvas.clientHeight);
+  const bw = Math.round(cw * dpr), bh = Math.round(ch * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; ovl.width = bw; ovl.height = bh; }
+  plotGeo = { ox: margin.left, oy: margin.top, dw: cw - margin.left - margin.right, dh: ch - margin.top - margin.bottom };
+  refreshRects();
+  if (currentData) schedule({ forceProfiles: true, heat: true, colorbar: true, cross: (crossPx ? lastHoverPt : null) });
 }
-new ResizeObserver(resizeCanvases).observe(document.getElementById('plotArea'));
-new ResizeObserver(resizeCanvases).observe(document.getElementById('profileArea'));
+let resizeRaf = 0;
+const ro = new ResizeObserver(() => {
+  if (!resizeRaf) resizeRaf = requestAnimationFrame(() => { resizeRaf = 0; resizeCanvases(); });
+});
+ro.observe(plotAreaEl);
 
 function plotData(data) {
   currentData = data;
   const { array } = data; const ny = array.dims[0], nx = array.dims[1];
   heatBuf.width = nx; heatBuf.height = ny;
-  dataMin = Infinity; dataMax = -Infinity;
-  for (let i = 0; i < array.values.length; i++) { const v = array.values[i]; if (v < dataMin) dataMin = v; if (v > dataMax) dataMax = v; }
+  heatImg = heatBufCtx.createImageData(nx, ny);   // ONE reusable backing buffer (was per redraw)
+  heatU32 = new Uint32Array(heatImg.data.buffer); // 32-bit pixel writes (was 4 byte writes + array alloc per pixel)
+  const vals = array.values;
+  let m0 = Infinity, m1 = -Infinity;
+  for (let i = 0; i < vals.length; i++) { const v = vals[i]; if (v !== v) continue; if (v < m0) m0 = v; if (v > m1) m1 = v; }
+  dataMin = isFinite(m0) ? m0 : 0; dataMax = isFinite(m1) ? m1 : 1;
   colorScale = { min: dataMin, max: dataMax, range: dataMax - dataMin || 1 };
   view = { i0: 0, i1: nx - 1, j0: 0, j1: ny - 1 };
-  const area = document.getElementById('plotArea');
-  canvas.width = area.clientWidth; canvas.height = area.clientHeight;
-  plotGeo = { ox: margin.left, oy: margin.top, dw: canvas.width - margin.left - margin.right, dh: canvas.height - margin.top - margin.bottom };
-  renderHeatBuffer(); drawHeatmapWithAxes();
-  document.getElementById('fileInfo').textContent = `${data.objectName} | ${array.name || 'Array'}: ${nx}×${ny} | X: ${data.xaxis.label||'x'} [${data.xaxis.values[0].toFixed(3)}, ${data.xaxis.values[nx-1].toFixed(3)}] ${data.xaxis.unit||''} | Y: ${data.yaxis.label||'y'} [${data.yaxis.values[0].toFixed(3)}, ${data.yaxis.values[ny-1].toFixed(3)}] ${data.yaxis.unit||''}`;
-  document.getElementById('zminInput').value = dataMin.toExponential(3); document.getElementById('zmaxInput').value = dataMax.toExponential(3);
-  drawColorbar(); drawProfiles(nx >> 1, ny >> 1);
+  profileState = null;
+  colScratch = null; profileBuckets = null;
+  cbarStrip = null; cbarStripKey = null;
+  cursorIdx = { cx: nx >> 1, cy: ny >> 1 };
+  resizeCanvases();
+  renderHeatBuffer();
+  drawHeatmapWithAxes();
+  drawColorbar();
+  drawProfilesIfNeeded(cursorIdx.cx, cursorIdx.cy);
+  drawOverlayNow(null); // no crosshair yet on fresh data
+  zminEl.value = dataMin.toExponential(3); zmaxEl.value = dataMax.toExponential(3);
+  fileInfoEl.textContent = `${data.objectName} | ${array.name || 'Array'}: ${nx}×${ny} | X: ${data.xaxis.label||'x'} [${data.xaxis.values[0].toFixed(3)}, ${data.xaxis.values[nx-1].toFixed(3)}] ${data.xaxis.unit||''} | Y: ${data.yaxis.label||'y'} [${data.yaxis.values[0].toFixed(3)}, ${data.yaxis.values[ny-1].toFixed(3)}] ${data.yaxis.unit||''}`;
+  if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } // everything drew synchronously already
+  dirtyHeat = dirtyRecolor = dirtyProfiles = dirtyColorbar = dirtyOverlay = dirtyCursor = false;
+  pendingCross = null; pendingCursor = null;
 }
 
-function changeColormap(name) { currentColormap = name; if (currentData) { renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar(); } }
-function toggleInvert() { invertColormap = document.getElementById('invertCheckbox').checked; if (currentData) { renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar(); } }
-function updateZRange() { if (!currentData) return; const min = parseFloat(document.getElementById('zminInput').value); const max = parseFloat(document.getElementById('zmaxInput').value); if (!isNaN(min) && !isNaN(max)) { colorScale = { min: min, max: max, range: max - min || 1 }; renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar(); } }
-function resetView() { if (!currentData) return; const nx = currentData.array.dims[1], ny = currentData.array.dims[0]; view = { i0: 0, i1: nx - 1, j0: 0, j1: ny - 1 }; colorScale = { min: dataMin, max: dataMax, range: dataMax - dataMin || 1 }; renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar(); drawProfiles(nx >> 1, ny >> 1); document.getElementById('status').textContent = 'View reset'; }
+function changeColormap(name) { currentColormap = name; buildLUT(); if (currentData) schedule({ recolor: true, colorbar: true }); }
+function toggleInvert() { invertColormap = document.getElementById('invertCheckbox').checked; buildLUT(); if (currentData) schedule({ recolor: true, colorbar: true }); }
+function updateZRange() {
+  if (!currentData) return;
+  const min = parseFloat(zminEl.value), max = parseFloat(zmaxEl.value);
+  if (!isNaN(min) && !isNaN(max)) { colorScale = { min: min, max: max, range: max - min || 1 }; schedule({ recolor: true, colorbar: true }); }
+}
+function resetView() {
+  if (!currentData) return;
+  const nx = currentData.array.dims[1], ny = currentData.array.dims[0];
+  view = { i0: 0, i1: nx - 1, j0: 0, j1: ny - 1 };
+  colorScale = { min: dataMin, max: dataMax, range: dataMax - dataMin || 1 };
+  cursorIdx = { cx: nx >> 1, cy: ny >> 1 };
+  zminEl.value = dataMin.toExponential(3); zmaxEl.value = dataMax.toExponential(3);
+  schedule({ recolor: true, colorbar: true, forceProfiles: true, cross: null, cursor: { cx: nx >> 1, cy: ny >> 1, fi: nx >> 1, fj: ny >> 1 } });
+  statusEl.textContent = 'View reset';
+}
 
-// ===== Mouse & Touch Helpers =====
-function clientToIndex(clientX, clientY) { const rect = canvas.getBoundingClientRect(); const mx = (clientX - rect.left) * (canvas.width / rect.width); const my = (clientY - rect.top) * (canvas.height / rect.height); const { ox, oy, dw, dh } = plotGeo; const fi = (mx - ox) / dw * (view.i1 - view.i0) + view.i0; const fj = (my - oy) / dh * (view.j1 - view.j0) + view.j0; return { fi, fj, cx: Math.floor(fi), cy: Math.floor(fj) }; }
+// ===== Mouse & Touch helpers (cached rects: no layout thrash on hover) =====
+function clientToIndex(clientX, clientY) {
+  const rect = canvasRect || canvas.getBoundingClientRect();
+  const mx = (clientX - rect.left) * ((canvas.width / dpr) / rect.width);
+  const my = (clientY - rect.top) * ((canvas.height / dpr) / rect.height);
+  const { ox, oy, dw, dh } = plotGeo;
+  const fi = (mx - ox) / dw * (view.i1 - view.i0) + view.i0;
+  const fj = (my - oy) / dh * (view.j1 - view.j0) + view.j0;
+  return { fi: fi, fj: fj, cx: Math.floor(fi), cy: Math.floor(fj) };
+}
 
 function applyZoom(factor, centerFi, centerFj) {
   const nx = currentData.array.dims[1], ny = currentData.array.dims[0];
@@ -827,6 +1114,7 @@ function applyZoom(factor, centerFi, centerFj) {
   if (view.j1 - view.j0 < minSize) { const c = (view.j0 + view.j1) / 2; view.j0 = c - minSize/2; view.j1 = c + minSize/2; }
   if (view.i0 < 0) { view.i1 -= view.i0; view.i0 = 0; }
   if (view.i1 > nx - 1) { view.i0 -= (view.i1 - (nx - 1)); view.i1 = nx - 1; }
+  if (view.i1 > nx - 1) view.i1 = nx - 1;
   if (view.j0 < 0) { view.j1 -= view.j0; view.j0 = 0; }
   if (view.j1 > ny - 1) { view.j0 -= (view.j1 - (ny - 1)); view.j1 = ny - 1; }
   if (view.i0 < 0) view.i0 = 0; if (view.j0 < 0) view.j0 = 0;
@@ -840,28 +1128,21 @@ function applyPan(dx, dy) {
   view.i0 -= di; view.i1 -= di; view.j0 -= dj; view.j1 -= dj;
   if (view.i0 < 0) { view.i1 -= view.i0; view.i0 = 0; }
   if (view.i1 > nx - 1) { view.i0 -= (view.i1 - (nx - 1)); view.i1 = nx - 1; }
+  if (view.i1 > nx - 1) view.i1 = nx - 1;
   if (view.j0 < 0) { view.j1 -= view.j0; view.j0 = 0; }
   if (view.j1 > ny - 1) { view.j0 -= (view.j1 - (ny - 1)); view.j1 = ny - 1; }
   if (view.i0 < 0) view.i0 = 0; if (view.j0 < 0) view.j0 = 0;
 }
 
-function updateCursorAndProfiles(cx, cy, fi, fj) {
+function setCursorText(c) {
+  if (!currentData) return;
   const nx = currentData.array.dims[1], ny = currentData.array.dims[0];
-  if (cx < 0 || cx >= nx || cy < 0 || cy >= ny) return;
+  if (c.cx < 0 || c.cx >= nx || c.cy < 0 || c.cy >= ny) return;
   const { xaxis, yaxis, array } = currentData;
-  const xv = indexToX(fi), yv = indexToY(fj), zv = array.values[cy * nx + cx];
-  document.getElementById('cursorText').textContent = `${xaxis.label||'X'}: ${xv.toFixed(4)} ${xaxis.unit||''} | ${yaxis.label||'Y'}: ${yv.toFixed(4)} ${yaxis.unit||''} | ${array.label||'Z'}: ${zv.toExponential(4)} ${array.unit||''}`;
-  drawProfiles(cx, cy);
-}
-
-function drawCrosshair(fi, fj) {
-  const theme = getTheme();
-  const { ox, oy, dw, dh } = plotGeo;
-  const px = ox + ((fi - view.i0) / (view.i1 - view.i0)) * dw;
-  const py = oy + ((fj - view.j0) / (view.j1 - view.j0)) * dh;
-  ctx.strokeStyle = theme==='dark' ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.4)';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(px, oy); ctx.lineTo(px, oy + dh); ctx.moveTo(ox, py); ctx.lineTo(ox + dw, py); ctx.stroke();
+  const zv = array.values[c.cy * nx + c.cx];
+  const zTxt = (zv === zv && isFinite(zv)) ? zv.toExponential(4) : 'NaN';
+  const txt = `${xaxis.label||'X'}: ${indexToX(c.fi).toFixed(4)} ${xaxis.unit||''} | ${yaxis.label||'Y'}: ${indexToY(c.fj).toFixed(4)} ${yaxis.unit||''} | ${array.label||'Z'}: ${zTxt} ${array.unit||''}`;
+  if (cursorTextEl.textContent !== txt) cursorTextEl.textContent = txt; // DOM write only when changed
 }
 
 // ===== Mouse =====
@@ -869,59 +1150,73 @@ canvas.addEventListener('wheel', (e) => {
   if (!currentData || !plotGeo) return; e.preventDefault();
   const { fi, fj, cx, cy } = clientToIndex(e.clientX, e.clientY);
   applyZoom(e.deltaY < 0 ? 0.85 : 1.15, fi, fj);
-  drawHeatmapWithAxes(); drawProfiles(cx, cy);
+  cursorIdx = { cx: cx, cy: cy };
+  drawOverlayNow({ fi: fi, fj: fj }); // synchronous: crosshair follows the zoom immediately
+  schedule({ heat: true, profiles: true, cursor: { cx: cx, cy: cy, fi: fi, fj: fj } });
 }, { passive: false });
 
-canvas.addEventListener('mousedown', (e) => { if (!currentData || !plotGeo) return; if (e.button === 0) { isPanning = true; canvas.classList.add('panning'); panLastX = e.clientX; panLastY = e.clientY; } });
+canvas.addEventListener('mousedown', (e) => { if (!currentData || !plotGeo) return; if (e.button === 0) { isPanning = true; canvas.classList.add('panning'); panLastX = e.clientX; panLastY = e.clientY; refreshRects(); drawOverlayNow(null); } });
 
 canvas.addEventListener('mousemove', (e) => {
-  if (!currentData || !plotGeo) return; const rect = canvas.getBoundingClientRect();
+  if (!currentData || !plotGeo) return;
+  const rect = canvasRect || canvas.getBoundingClientRect();
   if (isPanning) {
-    const dx = (e.clientX - panLastX) * (canvas.width / rect.width);
-    const dy = (e.clientY - panLastY) * (canvas.height / rect.height);
+    const dx = (e.clientX - panLastX) * ((canvas.width / dpr) / rect.width);
+    const dy = (e.clientY - panLastY) * ((canvas.height / dpr) / rect.height);
     applyPan(dx, dy);
     panLastX = e.clientX; panLastY = e.clientY;
-    drawHeatmapWithAxes();
-    const { cx, cy } = clientToIndex(e.clientX, e.clientY); drawProfiles(cx, cy);
+    const idx = clientToIndex(e.clientX, e.clientY);
+    cursorIdx = { cx: idx.cx, cy: idx.cy };
+    schedule({ heat: true, profiles: true });
     return;
   }
   const { fi, fj, cx, cy } = clientToIndex(e.clientX, e.clientY);
-  updateCursorAndProfiles(cx, cy, fi, fj);
-  drawHeatmapWithAxes(); drawCrosshair(fi, fj);
+  cursorIdx = { cx: cx, cy: cy };
+  // Crosshair drawn SYNCHRONOUSLY here (clear + 2 lines, < 0.1 ms): zero added
+  // frame delay, immune to any heavy work batched in the rAF tick.
+  drawOverlayNow({ fi: fi, fj: fj });
+  // Heavy, non-pointer-critical work stays coalesced: at most once per frame.
+  schedule({ profiles: true, cursor: { cx: cx, cy: cy, fi: fi, fj: fj } });
 });
 
 canvas.addEventListener('mouseup', () => { isPanning = false; canvas.classList.remove('panning'); });
-canvas.addEventListener('mouseleave', () => { isPanning = false; canvas.classList.remove('panning'); drawHeatmapWithAxes(); });
+canvas.addEventListener('mouseleave', () => { isPanning = false; canvas.classList.remove('panning'); drawOverlayNow(null); });
 
 // ===== Touch (pinch-zoom & pan) =====
 canvas.addEventListener('touchstart', (e) => {
   if (!currentData || !plotGeo) return;
   e.preventDefault();
-  if (e.touches.length === 1) { touchMode = 'pan'; touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY; }
-  else if (e.touches.length === 2) { touchMode = 'pinch'; const dx = e.touches[0].clientX - e.touches[1].clientX; const dy = e.touches[0].clientY - e.touches[1].clientY; lastPinchDist = Math.sqrt(dx*dx + dy*dy); }
+  if (!canvasRect) refreshRects();
+  if (e.touches.length === 1) { touchMode = 'pan'; touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY; drawOverlayNow(null); }
+  else if (e.touches.length === 2) { touchMode = 'pinch'; const dx = e.touches[0].clientX - e.touches[1].clientX; const dy = e.touches[0].clientY - e.touches[1].clientY; lastPinchDist = Math.sqrt(dx*dx + dy*dy); drawOverlayNow(null); }
 }, { passive: false });
 
 canvas.addEventListener('touchmove', (e) => {
   if (!currentData || !plotGeo) return;
   e.preventDefault();
-  const rect = canvas.getBoundingClientRect();
+  const rect = canvasRect || canvas.getBoundingClientRect();
   if (touchMode === 'pan' && e.touches.length === 1) {
-    const dx = (e.touches[0].clientX - touchLastX) * (canvas.width / rect.width);
-    const dy = (e.touches[0].clientY - touchLastY) * (canvas.height / rect.height);
+    const dx = (e.touches[0].clientX - touchLastX) * ((canvas.width / dpr) / rect.width);
+    const dy = (e.touches[0].clientY - touchLastY) * ((canvas.height / dpr) / rect.height);
     applyPan(dx, dy);
     touchLastX = e.touches[0].clientX; touchLastY = e.touches[0].clientY;
-    drawHeatmapWithAxes();
+    const idx = clientToIndex(e.touches[0].clientX, e.touches[0].clientY);
+    cursorIdx = { cx: idx.cx, cy: idx.cy };
+    schedule({ heat: true, profiles: true });
   } else if (touchMode === 'pinch' && e.touches.length === 2) {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     const dist = Math.sqrt(dx*dx + dy*dy);
-    const factor = lastPinchDist / dist;
-    const cxm = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-    const cym = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-    const { fi, fj } = clientToIndex(cxm, cym);
-    applyZoom(factor, fi, fj);
-    lastPinchDist = dist;
-    drawHeatmapWithAxes();
+    if (dist > 0) {
+      const factor = lastPinchDist / dist;
+      const cxm = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const cym = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const { fi, fj, cx, cy } = clientToIndex(cxm, cym);
+      applyZoom(factor, fi, fj);
+      lastPinchDist = dist;
+      cursorIdx = { cx: cx, cy: cy };
+      schedule({ heat: true, profiles: true });
+    }
   }
 }, { passive: false });
 
@@ -929,8 +1224,9 @@ canvas.addEventListener('touchend', (e) => {
   if (e.touches.length === 0) {
     if (touchMode === 'pan' && e.changedTouches.length === 1) {
       const { fi, fj, cx, cy } = clientToIndex(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
-      updateCursorAndProfiles(cx, cy, fi, fj);
-      drawHeatmapWithAxes(); drawCrosshair(fi, fj);
+      cursorIdx = { cx: cx, cy: cy };
+      drawOverlayNow({ fi: fi, fj: fj });
+      schedule({ cursor: { cx: cx, cy: cy, fi: fi, fj: fj }, profiles: true });
     }
     touchMode = null;
   } else if (e.touches.length === 1) {
@@ -938,8 +1234,11 @@ canvas.addEventListener('touchend', (e) => {
   }
 }, { passive: false });
 
-// ===== Colorbar drag (mouse + touch) =====
-function cbGetMx(clientX) { const rect = cbC.getBoundingClientRect(); return (clientX - rect.left) * (cbC.width / rect.width); }
+// ===== Colorbar drag (mouse + touch) - rAF-coalesced =====
+function cbGetMx(clientX) {
+  const rect = (cbRect || cbC.getBoundingClientRect());
+  return (clientX - rect.left) * ((cbC.clientWidth || rect.width) / rect.width);
+}
 function cbStartDrag(mx) {
   if (Math.abs(mx - cbHandlePos.minX) < 15) cbDragging = 'min';
   else if (Math.abs(mx - cbHandlePos.maxX) < 15) cbDragging = 'max';
@@ -947,49 +1246,89 @@ function cbStartDrag(mx) {
 }
 function cbUpdateDrag(mx) {
   if (!cbDragging || !currentData) return;
-  const barW = cbC.width - cbLayout.padL - cbLayout.padR;
+  const barW = cbC.clientWidth - cbLayout.padL - cbLayout.padR;
   const frac = Math.max(0, Math.min(1, (mx - cbLayout.padL) / barW));
   const val = dataMin + frac * (dataMax - dataMin);
   if (cbDragging === 'min') { colorScale.min = Math.min(val, colorScale.max - (dataMax - dataMin) * 0.001); } else { colorScale.max = Math.max(val, colorScale.min + (dataMax - dataMin) * 0.001); }
   colorScale.range = colorScale.max - colorScale.min;
-  document.getElementById('zminInput').value = colorScale.min.toExponential(3);
-  document.getElementById('zmaxInput').value = colorScale.max.toExponential(3);
-  renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar();
+  zminEl.value = colorScale.min.toExponential(3);
+  zmaxEl.value = colorScale.max.toExponential(3);
+  schedule({ recolor: true, colorbar: true }); // at most ONE recolour per frame no matter how fast the pointer moves
 }
-cbC.addEventListener('mousedown', (e) => cbStartDrag(cbGetMx(e.clientX)));
+cbC.addEventListener('mousedown', (e) => { cbStartDrag(cbGetMx(e.clientX)); });
 window.addEventListener('mousemove', (e) => { if (cbDragging) cbUpdateDrag(cbGetMx(e.clientX)); });
 window.addEventListener('mouseup', () => { cbDragging = null; });
-cbC.addEventListener('dblclick', () => { if (!currentData) return; colorScale = { min: dataMin, max: dataMax, range: dataMax - dataMin || 1 }; document.getElementById('zminInput').value = dataMin.toExponential(3); document.getElementById('zmaxInput').value = dataMax.toExponential(3); renderHeatBuffer(); drawHeatmapWithAxes(); drawColorbar(); });
+cbC.addEventListener('dblclick', () => {
+  if (!currentData) return;
+  colorScale = { min: dataMin, max: dataMax, range: dataMax - dataMin || 1 };
+  zminEl.value = dataMin.toExponential(3); zmaxEl.value = dataMax.toExponential(3);
+  schedule({ recolor: true, colorbar: true });
+});
 cbC.addEventListener('touchstart', (e) => { e.preventDefault(); cbStartDrag(cbGetMx(e.touches[0].clientX)); }, { passive: false });
 cbC.addEventListener('touchmove', (e) => { e.preventDefault(); if (cbDragging) cbUpdateDrag(cbGetMx(e.touches[0].clientX)); }, { passive: false });
 cbC.addEventListener('touchend', () => { cbDragging = null; }, { passive: false });
 
-// ===== Context Menu =====
+// ===== Context menu =====
 const ctxMenu = document.getElementById('ctxMenu');
-document.getElementById('plotArea').addEventListener('contextmenu', (e) => { e.preventDefault(); ctxMenu.style.display = 'block'; ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px'; ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - 130) + 'px'; });
+plotAreaEl.addEventListener('contextmenu', (e) => { e.preventDefault(); ctxMenu.style.display = 'block'; ctxMenu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px'; ctxMenu.style.top = Math.min(e.clientY, window.innerHeight - 130) + 'px'; });
 document.addEventListener('click', () => { ctxMenu.style.display = 'none'; });
 ctxMenu.addEventListener('click', (e) => { e.stopPropagation(); });
-function savePNG() { ctxMenu.style.display = 'none'; const link = document.createElement('a'); link.download = 'heatmap.png'; link.href = canvas.toDataURL('image/png'); link.click(); }
+function savePNG() {
+  ctxMenu.style.display = 'none';
+  if (!currentData) return;
+  canvas.toBlob(function(blob) { // toBlob + object URL: no giant base64 string in memory
+    if (!blob) return;
+    const link = document.createElement('a');
+    link.download = 'heatmap.png';
+    link.href = URL.createObjectURL(blob);
+    link.click();
+    setTimeout(function() { URL.revokeObjectURL(link.href); }, 5000);
+  }, 'image/png');
+}
 
-// ===== File loading =====
+// ===== File loading (parsing via Web Worker; UI never blocks) =====
 async function processFile(file) {
   showLoading('Parsing HDF5 file...');
-  try { const buffer = await file.arrayBuffer(); plotData(new HDF5Parser(buffer).parse()); document.getElementById('status').textContent = `Loaded: ${file.name}`; }
-  catch (err) { document.getElementById('status').textContent = `Error: ${err.message}`; }
-  hideLoading();
+  try {
+    const buffer = await file.arrayBuffer();
+    const t0 = performance.now();
+    const data = await parseInWorker(buffer);
+    plotData(data);
+    statusEl.textContent = `Loaded: ${file.name} (${Math.round(performance.now() - t0)} ms)`;
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+  } finally {
+    hideLoading();
+  }
 }
+
+// Last location is remembered the same way as hdf5_viewer02.html: plain
+// strings in localStorage ('hdf5_lastFile' = file name, 'hdf5_lastDir' =
+// parent folder name from getParent()), and the file picker opens with
+// startIn: lastDir || 'documents'.
 async function loadFile() {
-  const lastFileHandle = await loadHandle();
+  let lastDir = null;
+  try { lastDir = localStorage.getItem('hdf5_lastDir'); } catch (e) {}
+  const input = document.getElementById('fileInput');
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try { localStorage.setItem('hdf5_lastFile', file.name); } catch (err) {}
+    processFile(file);
+    input.value = '';
+  };
   if (window.showOpenFilePicker) {
     try {
-      const options = { types: [{ description: 'HDF5 files', accept: { 'application/octet-stream': ['.h5', '.hdf5', '.hdf'] } }] };
-      if (lastFileHandle) options.startIn = lastFileHandle; else options.startIn = 'documents';
-      const [handle] = await window.showOpenFilePicker(options);
-      await saveHandle(handle); processFile(await handle.getFile());
-    } catch (err) { if (err.name !== 'AbortError') console.error(err); }
+      const options = { types: [{ description: 'HDF5 files', accept: { 'application/octet-stream': ['.h5', '.hdf5', '.hdf'] } }], startIn: lastDir || 'documents' };
+      const handles = await window.showOpenFilePicker(options);
+      const file = await handles[0].getFile();
+      processFile(file);
+      try {
+        const dirHandle = await handles[0].getParent();
+        localStorage.setItem('hdf5_lastDir', dirHandle.name);
+      } catch(e) {}
+    } catch (err) { if (err.name !== 'AbortError') input.click(); }
   } else {
-    const input = document.getElementById('fileInput');
-    input.onchange = async (e) => { const file = e.target.files[0]; if (!file) return; processFile(file); input.value = ''; };
     input.click();
   }
 }
@@ -1002,14 +1341,18 @@ function loadDemo() {
     for (let i = 0; i < ny; i++) ya[i] = -6 + i * 0.04;
     for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) { const xv=xa[x],yv=ya[y]; const p1=Math.exp(-((xv-1)**2+yv**2)/0.5),p2=Math.exp(-((xv-2)**2+(yv-1)**2)/0.3),p3=Math.exp(-((xv-0.5)**2+(yv+2)**2)/0.4); arr[y*nx+x]=0.3+0.4*p1+0.3*p2+0.2*p3+0.02*Math.sin(yv*3); }
     plotData({ xaxis: { values: xa, label: 'k-path', unit: 'r.l.u' }, yaxis: { values: ya, label: 'Energy', unit: 'eV' }, array: { values: arr, dims: [ny,nx], label: 'A(k,w)', unit: '1/eV', name: 'Spectral Function' }, objectName: 'Demo Data' });
-    document.getElementById('status').textContent = 'Loaded demo data'; hideLoading();
+    statusEl.textContent = 'Loaded demo data'; hideLoading();
   }, 100);
 }
 function showLoading(t) { document.getElementById('loadText').textContent = t; document.getElementById('loadOverlay').style.display = 'flex'; }
 function hideLoading() { document.getElementById('loadOverlay').style.display = 'none'; }
 
 window.loadFile = loadFile; window.loadDemo = loadDemo; window.resetView = resetView; window.changeColormap = changeColormap; window.toggleInvert = toggleInvert; window.updateZRange = updateZRange; window.savePNG = savePNG; window.toggleTheme = toggleTheme;
+
+// ===== Init =====
+buildLUT();
 initTheme();
+refreshRects();
 loadDemo();
 </script>
 </body>
