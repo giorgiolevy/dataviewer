@@ -154,15 +154,40 @@ class HDF5Parser {
   u32(off) { return this.dv.getUint32(off, true); }
   u64(off) { return this.dv.getUint32(off, true) + this.dv.getUint32(off + 4, true) * 0x100000000; }
   f64(off) { return this.dv.getFloat64(off, true); }
+  // Vertically flips ONLY the 2D image array (row 0 <-> last row) so the first
+  // HDF5 row lands at the correct edge for the viewer. yaxis.values is left
+  // UNCHANGED (the viewer assumes it is monotonically increasing; reversing it
+  // would break the y-profile's x-range). Orientation of the axes is handled in
+  // the viewer, not here.
+  flipRows(res) {
+    if (!res || !res.array || !res.array.values) return res;
+    const dims = res.array.dims;
+    if (!dims || dims.length < 2) return res;
+    const ny = dims[0], nx = dims[1];
+    if (ny < 2 || nx < 1) return res;
+    const src = res.array.values;
+    const out = new Float64Array(src.length);
+    for (let r = 0; r < ny; r++) {
+      const srcRow = (ny - 1 - r) * nx;
+      const dstRow = r * nx;
+      for (let c = 0; c < nx; c++) out[dstRow + c] = src[srcRow + c];
+    }
+    res.array.values = out;
+    return res;
+  }
   parse() {
     if (this.raw[0] !== 0x89 || this.raw[1] !== 0x48) throw new Error("Not HDF5");
     let structuralErr = null;
-    try { const res = this.parseStructural(); if (res) return res; }
+    let res = null;
+    try { res = this.parseStructural(); }
     catch (err) { structuralErr = err; }
-    try { return this.extractData(); }
-    catch (err) {
-      throw new Error("Unrecognized HDF5 layout (structural: " + (structuralErr ? structuralErr.message : "no match") + "; heuristic scan: " + err.message + ")");
+    if (!res) {
+      try { res = this.extractData(); }
+      catch (err) {
+        throw new Error("Unrecognized HDF5 layout (structural: " + (structuralErr ? structuralErr.message : "no match") + "; heuristic scan: " + err.message + ")");
+      }
     }
+    return this.flipRows(res);
   }
   findSuperblock() {
     const sig = [0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -777,7 +802,35 @@ function renderHeatBuffer() {
 }
 
 function indexToX(i) { const { xaxis } = currentData; const nx = xaxis.values.length; const fi = Math.max(0, Math.min(nx - 1, i)); const li = Math.floor(fi), hi = Math.min(nx - 1, li + 1), f = fi - li; return xaxis.values[li] * (1 - f) + xaxis.values[hi] * f; }
+// Inverse of indexToX for a possibly NON-UNIFORM axis: given an axis value, return the
+// fractional index where that value occurs (linear search + interpolation). Lets ticks be
+// placed at their true position instead of assuming a uniform (linear) axis.
+function valueToIndexX(v) { const a = currentData.xaxis.values; const n = a.length;
+  if (n < 2) return 0;
+  const asc = a[n-1] >= a[0];
+  for (let i = 0; i < n-1; i++) {
+    const a0 = a[i], a1 = a[i+1];
+    if ((asc && v >= a0 && v <= a1) || (!asc && v <= a0 && v >= a1)) {
+      const d = a1 - a0; return d === 0 ? i : i + (v - a0) / d;
+    }
+  }
+  return v <= Math.min(a[0], a[n-1]) ? 0 : (n - 1);
+}
+function valueToIndexY(v) { const a = currentData.yaxis.values; const n = a.length;
+  if (n < 2) return 0;
+  const asc = a[n-1] >= a[0];
+  for (let i = 0; i < n-1; i++) {
+    const a0 = a[i], a1 = a[i+1];
+    if ((asc && v >= a0 && v <= a1) || (!asc && v <= a0 && v >= a1)) {
+      const d = a1 - a0; return d === 0 ? i : i + (v - a0) / d;
+    }
+  }
+  return v <= Math.min(a[0], a[n-1]) ? 0 : (n - 1);
+}
 function indexToY(j) { const { yaxis } = currentData; const ny = yaxis.values.length; const fj = Math.max(0, Math.min(ny - 1, j)); const lj = Math.floor(fj), hj = Math.min(ny - 1, lj + 1), f = fj - lj; return yaxis.values[lj] * (1 - f) + yaxis.values[hj] * f; }
+// The parser flips the image rows, so a DISPLAYED array row j corresponds to physical data
+// row (ny-1-j). rowToEnergy maps a displayed array row index to its physical y-axis value.
+function rowToEnergy(j) { const ny = currentData.array.dims[0]; return indexToY(ny - 1 - j); }
 
 function drawHeatmapWithAxes() {
   if (!currentData || !plotGeo || !view) return;
@@ -795,16 +848,17 @@ function drawHeatmapWithAxes() {
   ctx.drawImage(heatBuf, i0, j0, sw, sh, ox, oy, dw, dh);
   ctx.imageSmoothingEnabled = false;
   ctx.strokeStyle = axisCol; ctx.lineWidth = 1; ctx.strokeRect(ox + 0.5, oy + 0.5, dw, dh);
-  const xMin = indexToX(i0), xMax = indexToX(i1), yMin = indexToY(j0), yMax = indexToY(j1);
-  const xT = niceTicks(xMin, xMax, 8), yT = niceTicks(yMin, yMax, 8);
+  const xMin = indexToX(i0), xMax = indexToX(i1), yMin = rowToEnergy(j0), yMax = rowToEnergy(j1);
+  // rowToEnergy(j0) is the largest energy (parser flips rows), so order the y-range ascending
+  // before handing it to niceTicks (which expects min < max).
+  const yLo = Math.min(yMin, yMax), yHi = Math.max(yMin, yMax);
+  const xT = niceTicks(xMin, xMax, 8), yT = niceTicks(yLo, yHi, 8);
   const nx = currentData.array.dims[1], ny = currentData.array.dims[0];
-  const xden = (currentData.xaxis.values[nx-1] - currentData.xaxis.values[0]) || 1;
-  const yden = (currentData.yaxis.values[ny-1] - currentData.yaxis.values[0]) || 1;
   ctx.fillStyle = axisCol; ctx.strokeStyle = axisCol; ctx.lineWidth = 1; ctx.font = '12px Arial';
   const tickLen = 5;
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   for (const tv of xT) {
-    const fi = (tv - currentData.xaxis.values[0]) / xden * (nx - 1);
+    const fi = valueToIndexX(tv); // non-uniform axis: true index of value tv
     const px = ox + ((fi - i0) / (i1 - i0)) * dw;
     if (px < ox - 1 || px > ox + dw + 1) continue;
     ctx.beginPath(); ctx.moveTo(px, oy + dh); ctx.lineTo(px, oy + dh - tickLen); ctx.stroke();
@@ -815,8 +869,11 @@ function drawHeatmapWithAxes() {
   ctx.fillText((currentData.xaxis.label||'X') + (currentData.xaxis.unit ? ` (${currentData.xaxis.unit})` : ''), ox + dw/2, oy + dh + 35);
   ctx.font = '12px Arial'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (const tv of yT) {
-    const fj = (tv - currentData.yaxis.values[0]) / yden * (ny - 1);
-    const py = oy + dh - ((fj - j0) / (j1 - j0)) * dh;
+    // The parser flips the image rows, so the array row showing energy tv is (ny-1) minus the
+    // y-axis index. Use the same top-origin mapping as the image/crosshair so ticks stay aligned
+    // with the displayed data at every zoom/pan window.
+    const fj = (ny - 1) - valueToIndexY(tv); // true (possibly non-uniform) axis index, mirrored for the row-flip
+    const py = oy + ((fj - j0) / (j1 - j0)) * dh;
     if (py < oy - 1 || py > oy + dh + 1) continue;
     ctx.beginPath(); ctx.moveTo(ox, py); ctx.lineTo(ox + tickLen, py); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(ox + dw, py); ctx.lineTo(ox + dw - tickLen, py); ctx.stroke();
@@ -918,7 +975,7 @@ function drawProfilesIfNeeded(cx, cy) {
   if (!currentData || !view) return;
   const ny = currentData.array.dims[0], nx = currentData.array.dims[1];
   if (cx < 0 || cx >= nx || cy < 0 || cy >= ny) return;
-  const key = view.i0 + '|' + view.i1 + '|' + view.j0 + '|' + view.j1;
+  const key = view.i0 + '|' + view.i1 + '|' + view.j0 + '|' + view.j1 + '|' + (crossPx ? 1 : 0);
   if (profileState && profileState.key === key && profileState.cx === cx && profileState.cy === cy) return;
   profileState = { key: key, cx: cx, cy: cy };
   drawProfiles(cx, cy);
@@ -931,14 +988,25 @@ function drawProfiles(xi, yi) {
   const vals = array.values;
   const xRow = vals.subarray(cj * nx, cj * nx + nx); // zero-copy row (was Array.from per mousemove)
   if (!colScratch || colScratch.length !== ny) colScratch = new Float64Array(ny); // reused column buffer
-  for (let i = 0; i < ny; i++) colScratch[i] = vals[i * nx + ci];
+  // The parser flips the image rows so the image displays right-side-up, but yaxis.values stays
+  // in file order. To keep the Y-profile's data paired with the y-axis the same way the image is
+  // oriented, read the column in reversed row order so the profile's peak falls on the same side
+  // as the bright band in the (flipped) image. Labels remain ascending (-6..+6 left->right).
+  for (let i = 0; i < ny; i++) colScratch[i] = vals[(ny - 1 - i) * nx + ci];
   const xMinView = indexToX(view.i0), xMaxView = indexToX(view.i1);
-  drawProfile(hCtx, hPC, xaxis.values, xRow, xaxis.label || 'X', xaxis.unit || '', array.label || 'Z', array.unit || '', cj, yaxis.values[cj], yaxis.label || 'Y', xMinView, xMaxView);
-  const yMinView = indexToY(view.j0), yMaxView = indexToY(view.j1);
-  drawProfile(vCtx, vPC, yaxis.values, colScratch, yaxis.label || 'Y', yaxis.unit || '', array.label || 'Z', array.unit || '', ci, xaxis.values[ci], xaxis.label || 'X', yMinView, yMaxView);
+  drawProfile(hCtx, hPC, xaxis.values, xRow, xaxis.label || 'X', xaxis.unit || '', array.label || 'Z', array.unit || '', cj, yaxis.values[ny - 1 - cj], yaxis.label || 'Y', xMinView, xMaxView, false, xaxis.values[ci], crossPx);
+  // Y-profile: labels stay ascending (-6..+6 left->right). The column data above is read in
+  // flipped row order so the profile's peak lines up with the same energy as the bright band in
+  // the flipped image. flipX=false keeps the labels ascending and the curve in that same frame.
+  // Because element i of colScratch holds buffer row (ny-1-i), the visible row window view.j0..j1
+  // must be mirrored into profile index space for zoom/pan to follow the image (not act flipped):
+  //   buffer rows j0..j1  ->  profile elements (ny-1-j1)..(ny-1-j0)
+  const yMinView = rowToEnergy(view.j1), yMaxView = rowToEnergy(view.j0);
+  const yvLo = Math.min(yMinView, yMaxView), yvHi = Math.max(yMinView, yMaxView);
+  drawProfile(vCtx, vPC, yaxis.values, colScratch, yaxis.label || 'Y', yaxis.unit || '', array.label || 'Z', array.unit || '', ci, xaxis.values[ci], xaxis.label || 'X', yvLo, yvHi, false, yaxis.values[ny - 1 - cj], crossPx);
 }
 
-function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, sliceIdx, sliceVal, sliceAxisLabel, viewMin, viewMax) {
+function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, sliceIdx, sliceVal, sliceAxisLabel, viewMin, viewMax, flipX, markerVal, showMarker) {
   const theme = getTheme();
   const axisCol = theme==='dark' ? '#c9d1d9' : '#333333';
   const bgCol = theme==='dark' ? '#0d1117' : '#ffffff';
@@ -958,6 +1026,9 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
   const xMin = viewMin !== undefined ? viewMin : xAxis[0];
   const xMax = viewMax !== undefined ? viewMax : xAxis[n - 1];
   const xRange = (xMax - xMin) || 1;
+  // Horizontal value->pixel mapping. flipX mirrors left<->right so the Y-profile can follow
+  // the image's vertical axis (image top at profile-left) while the ticks stay readable.
+  const xToPx = (v) => { const t = (v - xMin) / xRange; return pm.left + (flipX ? (1 - t) : t) * pw; };
 
   // min/max decimation: one bucket per pixel column (O(n) once per redraw, ~2*plotWidth segments drawn)
   const nb = Math.min(16384, Math.max(2, Math.ceil(pw) + 1));
@@ -970,7 +1041,7 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
   for (let i = 0; i < n; i++) {
     const xv = xAxis[i];
     if (xv < xMin || xv > xMax) continue;
-    const px = x0 + ((xv - xMin) / xRange) * pw;
+    const px = x0 + (flipX ? (1 - (xv - xMin) / xRange) : (xv - xMin) / xRange) * pw;
     const v = yData[i];
     if (v !== v || v === Infinity || v === -Infinity) continue; // NaN/Inf skipped, not poisoning the axis
     if (v < lo) lo = v;
@@ -989,12 +1060,12 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
   pctx.strokeStyle = gridCol; pctx.lineWidth = 0.5;
   const yTicks = niceTicks(yMin, yMax, 4), xTicks = niceTicks(xMin, xMax, 5);
   for (const tv of yTicks) { const py = pm.top + ph - ((tv - yMin) / yRangeP) * ph; if (py < pm.top || py > pm.top + ph) continue; pctx.beginPath(); pctx.moveTo(pm.left, py); pctx.lineTo(pm.left + pw, py); pctx.stroke(); }
-  for (const tv of xTicks) { const px = pm.left + ((tv - xMin) / xRange) * pw; if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + ph); pctx.stroke(); }
+  for (const tv of xTicks) { const px = xToPx(tv); if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + ph); pctx.stroke(); }
   pctx.strokeStyle = axisCol; pctx.lineWidth = 1; pctx.strokeRect(pm.left + 0.5, pm.top + 0.5, pw, ph);
   pctx.fillStyle = axisCol;
   const tickLen = 4;
   pctx.font = '11px Arial'; pctx.textAlign = 'center'; pctx.textBaseline = 'top';
-  for (const tv of xTicks) { const px = pm.left + ((tv - xMin) / xRange) * pw; if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top + ph); pctx.lineTo(px, pm.top + ph - tickLen); pctx.stroke(); pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + tickLen); pctx.stroke(); pctx.fillText(fmt(tv), px, pm.top + ph + 6); }
+  for (const tv of xTicks) { const px = xToPx(tv); if (px < pm.left || px > pm.left + pw) continue; pctx.beginPath(); pctx.moveTo(px, pm.top + ph); pctx.lineTo(px, pm.top + ph - tickLen); pctx.stroke(); pctx.beginPath(); pctx.moveTo(px, pm.top); pctx.lineTo(px, pm.top + tickLen); pctx.stroke(); pctx.fillText(fmt(tv), px, pm.top + ph + 6); }
   pctx.font = '12px Arial'; pctx.fillText(xLabel + (xUnit ? ` (${xUnit})` : ''), pm.left + pw / 2, h - 15);
   pctx.font = '11px Arial'; pctx.textAlign = 'right'; pctx.textBaseline = 'middle';
   for (const tv of yTicks) { const py = pm.top + ph - ((tv - yMin) / yRangeP) * ph; if (py < pm.top || py > pm.top + ph) continue; pctx.beginPath(); pctx.moveTo(pm.left, py); pctx.lineTo(pm.left + tickLen, py); pctx.stroke(); pctx.beginPath(); pctx.moveTo(pm.left + pw, py); pctx.lineTo(pm.left + pw - tickLen, py); pctx.stroke(); pctx.fillText(fmt(tv), pm.left - 6, py); }
@@ -1012,7 +1083,7 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
       if (xv < xMin || xv > xMax) continue;
       const v = yData[i];
       if (v !== v || v === Infinity || v === -Infinity) continue;
-      const px = pm.left + ((xv - xMin) / xRange) * pw;
+      const px = xToPx(xv);
       const py = pm.top + ph - ((v - yMin) / yRangeP) * ph;
       if (!started) { pctx.moveTo(px, py); started = true; } else pctx.lineTo(px, py);
     }
@@ -1027,6 +1098,25 @@ function drawProfile(pctx, pcanvas, xAxis, yData, xLabel, xUnit, zLabel, zUnit, 
     }
   }
   pctx.stroke(); pctx.restore();
+  // Crosshair position marker: a dashed vertical line at the cursor's value along this
+  // profile's horizontal axis, drawn only while the crosshair is visible.
+  if (showMarker && markerVal !== undefined && markerVal !== null && isFinite(markerVal)) {
+    const mv = xToPx(markerVal);
+    if (mv >= pm.left - 0.5 && mv <= pm.left + pw + 0.5) {
+      const themeX = getTheme();
+      const markCol = themeX === 'dark' ? '#ffb454' : '#e07000';
+      pctx.save();
+      pctx.strokeStyle = markCol;
+      pctx.lineWidth = 1;
+      if (pctx.setLineDash) pctx.setLineDash([4, 3]);
+      pctx.beginPath();
+      pctx.moveTo(mv, pm.top);
+      pctx.lineTo(mv, pm.top + ph);
+      pctx.stroke();
+      if (pctx.setLineDash) pctx.setLineDash([]);
+      pctx.restore();
+    }
+  }
 }
 
 // ===== Responsive / DPR-aware sizing (single ResizeObserver, rAF-debounced) =====
@@ -1065,8 +1155,8 @@ function plotData(data) {
   renderHeatBuffer();
   drawHeatmapWithAxes();
   drawColorbar();
+  drawOverlayNow(null); // no crosshair yet on fresh data (sets crossPx before profiles draw)
   drawProfilesIfNeeded(cursorIdx.cx, cursorIdx.cy);
-  drawOverlayNow(null); // no crosshair yet on fresh data
   zminEl.value = dataMin.toExponential(3); zmaxEl.value = dataMax.toExponential(3);
   fileInfoEl.textContent = `${data.objectName} | ${array.name || 'Array'}: ${nx}×${ny} | X: ${data.xaxis.label||'x'} [${data.xaxis.values[0].toFixed(3)}, ${data.xaxis.values[nx-1].toFixed(3)}] ${data.xaxis.unit||''} | Y: ${data.yaxis.label||'y'} [${data.yaxis.values[0].toFixed(3)}, ${data.yaxis.values[ny-1].toFixed(3)}] ${data.yaxis.unit||''}`;
   if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } // everything drew synchronously already
@@ -1100,7 +1190,9 @@ function clientToIndex(clientX, clientY) {
   const { ox, oy, dw, dh } = plotGeo;
   const fi = (mx - ox) / dw * (view.i1 - view.i0) + view.i0;
   const fj = (my - oy) / dh * (view.j1 - view.j0) + view.j0;
-  return { fi: fi, fj: fj, cx: Math.floor(fi), cy: Math.floor(fj) };
+  // inside: pointer is within the data plot rectangle (not the axis/label margins)
+  const inside = mx >= ox && mx <= ox + dw && my >= oy && my <= oy + dh;
+  return { fi: fi, fj: fj, cx: Math.floor(fi), cy: Math.floor(fj), inside: inside };
 }
 
 function applyZoom(factor, centerFi, centerFj) {
@@ -1141,17 +1233,17 @@ function setCursorText(c) {
   const { xaxis, yaxis, array } = currentData;
   const zv = array.values[c.cy * nx + c.cx];
   const zTxt = (zv === zv && isFinite(zv)) ? zv.toExponential(4) : 'NaN';
-  const txt = `${xaxis.label||'X'}: ${indexToX(c.fi).toFixed(4)} ${xaxis.unit||''} | ${yaxis.label||'Y'}: ${indexToY(c.fj).toFixed(4)} ${yaxis.unit||''} | ${array.label||'Z'}: ${zTxt} ${array.unit||''}`;
+  const txt = `${xaxis.label||'X'}: ${indexToX(c.fi).toFixed(4)} ${xaxis.unit||''} | ${yaxis.label||'Y'}: ${rowToEnergy(c.fj).toFixed(4)} ${yaxis.unit||''} | ${array.label||'Z'}: ${zTxt} ${array.unit||''}`;
   if (cursorTextEl.textContent !== txt) cursorTextEl.textContent = txt; // DOM write only when changed
 }
 
 // ===== Mouse =====
 canvas.addEventListener('wheel', (e) => {
   if (!currentData || !plotGeo) return; e.preventDefault();
-  const { fi, fj, cx, cy } = clientToIndex(e.clientX, e.clientY);
+  const { fi, fj, cx, cy, inside } = clientToIndex(e.clientX, e.clientY);
   applyZoom(e.deltaY < 0 ? 0.85 : 1.15, fi, fj);
   cursorIdx = { cx: cx, cy: cy };
-  drawOverlayNow({ fi: fi, fj: fj }); // synchronous: crosshair follows the zoom immediately
+  drawOverlayNow(inside ? { fi: fi, fj: fj } : null); // crosshair only over the data area
   schedule({ heat: true, profiles: true, cursor: { cx: cx, cy: cy, fi: fi, fj: fj } });
 }, { passive: false });
 
@@ -1170,8 +1262,15 @@ canvas.addEventListener('mousemove', (e) => {
     schedule({ heat: true, profiles: true });
     return;
   }
-  const { fi, fj, cx, cy } = clientToIndex(e.clientX, e.clientY);
+  const { fi, fj, cx, cy, inside } = clientToIndex(e.clientX, e.clientY);
   cursorIdx = { cx: cx, cy: cy };
+  // Only draw the crosshair when the pointer is over the data area; in the axis/label
+  // margins the plot rectangle is not covered by data, so a crosshair there is meaningless.
+  if (!inside) {
+    drawOverlayNow(null);
+    schedule({ profiles: true });
+    return;
+  }
   // Crosshair drawn SYNCHRONOUSLY here (clear + 2 lines, < 0.1 ms): zero added
   // frame delay, immune to any heavy work batched in the rAF tick.
   drawOverlayNow({ fi: fi, fj: fj });
@@ -1180,7 +1279,7 @@ canvas.addEventListener('mousemove', (e) => {
 });
 
 canvas.addEventListener('mouseup', () => { isPanning = false; canvas.classList.remove('panning'); });
-canvas.addEventListener('mouseleave', () => { isPanning = false; canvas.classList.remove('panning'); drawOverlayNow(null); });
+canvas.addEventListener('mouseleave', () => { isPanning = false; canvas.classList.remove('panning'); drawOverlayNow(null); schedule({ profiles: true }); });
 
 // ===== Touch (pinch-zoom & pan) =====
 canvas.addEventListener('touchstart', (e) => {
@@ -1223,9 +1322,9 @@ canvas.addEventListener('touchmove', (e) => {
 canvas.addEventListener('touchend', (e) => {
   if (e.touches.length === 0) {
     if (touchMode === 'pan' && e.changedTouches.length === 1) {
-      const { fi, fj, cx, cy } = clientToIndex(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
+      const { fi, fj, cx, cy, inside } = clientToIndex(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
       cursorIdx = { cx: cx, cy: cy };
-      drawOverlayNow({ fi: fi, fj: fj });
+      drawOverlayNow(inside ? { fi: fi, fj: fj } : null);
       schedule({ cursor: { cx: cx, cy: cy, fi: fi, fj: fj }, profiles: true });
     }
     touchMode = null;
