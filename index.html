@@ -84,6 +84,7 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-colo
         <option value="inferno">Inferno</option>
         <option value="viridis">Viridis</option>
         <option value="plasma">Plasma</option>
+        <option value="terrain">Terrain</option>
         <option value="grayscale">White to Black</option>
         <option value="diverging">Navy-Red Diverging</option>
       </select>
@@ -682,30 +683,70 @@ function refreshRects() {
 
 const margin = { top: 15, right: 20, bottom: 60, left: 70 };
 
-const colormaps = {
-  viridis: [[68,1,84],[71,19,101],[72,38,119],[69,55,129],[62,74,137],[55,95,142],[49,114,145],[43,133,140],[38,152,131],[33,170,122],[31,187,113],[42,194,108],[62,198,99],[84,201,92],[106,204,85],[129,206,77],[152,207,70],[175,208,61],[198,207,51],[221,205,40],[243,201,29],[253,185,37],[253,157,58],[253,141,59],[251,117,49],[248,93,40],[245,70,31],[242,47,21],[239,24,12],[229,0,0]],
-  plasma: [[13,8,135],[34,13,168],[58,11,191],[81,10,203],[105,9,214],[129,10,221],[152,15,226],[176,24,227],[199,37,226],[221,54,219],[240,77,204],[252,105,184],[255,137,161],[253,170,131],[247,203,101],[239,237,72],[221,250,51],[192,253,43],[162,253,42],[131,252,47]],
-  inferno: [[0,0,4],[11,1,26],[22,3,64],[34,5,101],[46,8,139],[59,13,177],[72,19,210],[86,28,234],[101,41,249],[117,57,255],[134,77,255],[152,97,251],[170,120,243],[188,143,230],[206,168,211],[222,192,190],[236,214,170],[246,233,153],[253,248,143],[255,255,179]],
-  grayscale: [[255,255,255],[240,240,240],[220,220,220],[200,200,200],[170,170,170],[140,140,140],[100,100,100],[60,60,60],[0,0,0]],
-  diverging: [[0,0,102],[50,50,153],[102,102,204],[178,178,229],[255,255,255],[229,178,178],[204,102,102],[153,50,50],[102,0,0]]
+const CMAP_STOPS = {
+  // 8-bit anchors, the same tables FitWorkbench uses (D-23, E-11/E-25).
+  // viridis/plasma/inferno are the matplotlib colormaps sampled at
+  // 0, 0.1, ..., 1.
+  viridis: [[68,1,84],[72,36,117],[65,68,135],[53,95,141],[42,120,142],
+            [33,145,140],[34,168,132],[68,191,112],[122,209,81],
+            [189,223,38],[253,231,37]],
+  plasma:  [[13,8,135],[65,4,157],[106,0,168],[143,13,164],[177,42,144],
+            [204,71,120],[225,100,98],[242,132,75],[252,166,54],
+            [252,206,37],[240,249,33]],
+  inferno: [[0,0,4],[22,11,57],[66,10,104],[106,23,110],[147,38,103],
+            [188,55,84],[221,81,58],[243,120,25],[252,165,10],
+            [246,215,70],[252,255,164]],
+  // IDL Terrain256, gl2_ctable.tbl #25.  Positions are 0..255 LUT indices.
+  terrain: {
+    pos: [0, 20, 24, 37, 94, 102, 110, 152, 224, 240, 255],
+    rgb: [[51,51,154],[9,136,239],[0,154,255],[0,201,97],
+          [224,249,146],[255,255,154],[238,230,142],
+          [138,92,79],[219,204,200],[237,229,227],[253,253,253]]
+  },
+  grayscale: [[255,255,255],[240,240,240],[220,220,220],[200,200,200],
+              [170,170,170],[140,140,140],[100,100,100],[60,60,60],[0,0,0]],
+  diverging: [[0,0,102],[50,50,153],[102,102,204],[178,178,229],
+              [255,255,255],[229,178,178],[204,102,102],[153,50,50],[102,0,0]]
 };
+const LUTS = {};
+function colormapRGB(name) {
+  if (LUTS[name]) return LUTS[name];
+  const stops = CMAP_STOPS[name] || CMAP_STOPS.viridis;
+  const out = new Uint8Array(256 * 3);
+  if (stops.pos) {
+    // Positioned stops (0..255), e.g. the IDL Terrain256 table.
+    let j = 0;
+    for (let i = 0; i < 256; i++) {
+      while (j < stops.pos.length - 2 && i > stops.pos[j + 1]) j++;
+      const f = (i - stops.pos[j]) / (stops.pos[j + 1] - stops.pos[j]);
+      const a = stops.rgb[j], b = stops.rgb[j + 1];
+      for (let c = 0; c < 3; c++)
+        out[i * 3 + c] = Math.round(a[c] * (1 - f) + b[c] * f);
+    }
+  } else {
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255 * (stops.length - 1);
+      const k = Math.min(stops.length - 2, Math.floor(t));
+      const f = t - k;
+      const a = stops[k], b = stops[k + 1];
+      for (let c = 0; c < 3; c++)
+        out[i * 3 + c] = Math.round(a[c] * (1 - f) + b[c] * f);
+    }
+  }
+  LUTS[name] = out;
+  return out;
+}
 
 // ===== Colormap LUT: 256-entry table packed as ABGR u32 for 32-bit writes =====
 const NAN_COLOR = (255 << 24) | (97 << 16) | (97 << 8) | 26; // distinct dark blue-grey for NaN
 let cbarVersion = 0, cbarStrip = null, cbarStripKey = null;
 let lut = new Uint32Array(256);
 function buildLUT() {
-  const c = colormaps[currentColormap];
+  const rgb = colormapRGB(currentColormap);
   for (let i = 0; i < 256; i++) {
-    let t = i / 255;
-    if (invertColormap) t = 1 - t;
-    const pos = t * (c.length - 1);
-    const idx = Math.floor(pos), f = pos - idx;
-    const a = c[idx], b = c[Math.min(idx + 1, c.length - 1)];
-    const r = Math.round(a[0] + (b[0] - a[0]) * f);
-    const g = Math.round(a[1] + (b[1] - a[1]) * f);
-    const bl = Math.round(a[2] + (b[2] - a[2]) * f);
-    lut[i] = (255 << 24) | (bl << 16) | (g << 8) | r;
+    const j = invertColormap ? 255 - i : i;
+    const r = rgb[j * 3], g = rgb[j * 3 + 1], b = rgb[j * 3 + 2];
+    lut[i] = (255 << 24) | (b << 16) | (g << 8) | r;
   }
   cbarVersion++;
 }
